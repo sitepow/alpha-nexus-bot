@@ -1,0 +1,8 @@
+services:
+  mt5server:
+    image: lprett/mt5linux:latest
+    container_name: mt5-server
+    ports:
+      - "8002:18812"
+      - "5901:5901"
+      - "8080:8080"
