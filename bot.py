@@ -1,37 +1,40 @@
 #!/usr/bin/env python3
 """
-Single-file Price Action and SMC bot for mt5linux.
+Single-file rule-based SMC / Price Action bot for mt5linux.
 
-Operational rules:
-- H4 confirmed swing structure and EMA filter.
-- M15 displacement order blocks or three-candle fair value gaps.
-- Frozen premium or discount filter at zone creation.
-- First post-creation M5 touch only.
-- M5 liquidity sweep at or shortly after that touch.
-- Subsequent M5 close through a pre-sweep confirmed swing.
+Signal rules:
+- H4 confirmed swing structure and EMA bias.
 - Closed candles only.
-- No repeated entry from the same zone.
+- M15 displacement with first close-based structure break.
+- OB and FVG confluence from the same displacement impulse.
+- Frozen premium / discount filter at zone creation.
+- First post-creation M5 touch only.
+- M5 liquidity sweep and subsequent close-based confirmation.
+- Optional additional M15 confirmation after the sweep.
+- Zone age and touch timeout limits.
 
 Execution rules:
-- Dry-run mode is enabled by default.
+- Dry-run by default.
+- Live mode additionally requires ALLOW_LIVE_TRADING=true.
 - Hedging accounts only.
 - One position or active order per symbol, regardless of magic.
 - Durable execution journal before every trading request.
 - Ambiguous execution blocks further requests until reconciled.
-- Position tracking uses the stable position identifier.
-- Initial risk distance is immutable.
-- Stop changes must not increase risk.
-- Partial closes are reconciled from actual deals.
+- Stable position identifiers.
+- Immutable initial risk distance.
+- Stop updates must not increase risk.
+- Partial and full exits are reconciled from actual deals.
 
 Limitations:
-- This is a rule-based interpretation of SMC.
-- OHLC data does not reveal institutional intent.
-- Intrabar event ordering cannot be reconstructed from OHLC.
-- Server-side SL and TP remain necessary.
-- Standalone account fees may not be attributable to a position.
-- Live execution requires broker-specific testing.
+- OHLC data cannot establish institutional intent.
+- Intrabar ordering cannot be reconstructed from OHLC.
+- The local news calendar is operator-maintained, not an automatic feed.
+- Dry-run logs signals; it is not a fill simulator or backtester.
+- Server-side SL / TP remain necessary.
+- Gaps and slippage can exceed estimated risk.
+- Broker-specific demo testing is required.
 
-All application-authored messages and comments are English.
+Application-authored messages and comments are English.
 """
 
 import hashlib
@@ -42,11 +45,13 @@ import re
 import sys
 import time
 import uuid
+
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_FLOOR
 from pathlib import Path
 
 import requests
+
 from dotenv import load_dotenv
 from mt5linux import MetaTrader5
 
@@ -63,80 +68,156 @@ load_dotenv(ROOT / ".env")
 def env_bool(name, default):
     value = os.getenv(name, str(default)).strip().lower()
     if value not in {"true", "false", "1", "0", "yes", "no"}:
-        raise ValueError("Invalid Boolean configuration.")
+        raise ValueError(f"Invalid Boolean configuration: {name}")
     return value in {"true", "1", "yes"}
 
 
+def env_float(name, default):
+    value = float(os.getenv(name, str(default)))
+    if not math.isfinite(value):
+        raise ValueError(f"Non-finite configuration: {name}")
+    return value
+
+
+def env_int(name, default):
+    return int(os.getenv(name, str(default)))
+
+
 DRY_RUN = env_bool("DRY_RUN", False)
+ALLOW_LIVE_TRADING = env_bool("ALLOW_LIVE_TRADING", True)
 
 SYMBOLS = [
     item.strip()
     for item in os.getenv(
-        "SYMBOLS",
-        "EURUSDm,GBPUSDm,USDJPYm,XAUUSDm",
+        "SYMBOLS", "EURUSDm,GBPUSDm,USDJPYm,XAUUSDm"
     ).split(",")
     if item.strip()
 ]
 
-MAGIC = 990011
+MAGIC = env_int("MAGIC", 990011)
+
+# Preserve compatibility with the original state file.
 STATE_VERSION = 2
 
-POLL_SECONDS = float(os.getenv("POLL_SECONDS", "15"))
-RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", "5"))
-COMMISSION_PER_LOT = float(os.getenv("COMMISSION_PER_LOT", "0"))
+POLL_SECONDS = env_float("POLL_SECONDS", 15)
 
-MAX_SPREAD_POINTS = float(os.getenv("MAX_SPREAD_POINTS", "30"))
+# Fixed money budget in account currency, not a percentage.
+RISK_PER_TRADE = env_float("RISK_PER_TRADE", 5)
+
+# Estimated round-trip commission in account currency per lot.
+COMMISSION_PER_LOT = env_float("COMMISSION_PER_LOT", 0)
+
+MAX_SPREAD_POINTS = env_float("MAX_SPREAD_POINTS", 30)
 MAX_SPREAD_BY_SYMBOL = json.loads(
     os.getenv("MAX_SPREAD_BY_SYMBOL_JSON", "{}")
 )
 
-MAX_OPEN_POSITIONS = 2
-MAX_DAILY_TRADES = 6
-MAX_DAILY_LOSS_PCT = 0.03
-MAX_CONSECUTIVE_LOSSES = 3
-COOLDOWN_SECONDS = 3600
+MAX_OPEN_POSITIONS = env_int("MAX_OPEN_POSITIONS", 2)
+MAX_DAILY_TRADES = env_int("MAX_DAILY_TRADES", 6)
+MAX_DAILY_LOSS_PCT = env_float("MAX_DAILY_LOSS_PCT", 0.03)
+MAX_CONSECUTIVE_LOSSES = env_int("MAX_CONSECUTIVE_LOSSES", 3)
+COOLDOWN_SECONDS = env_float("COOLDOWN_SECONDS", 3600)
 
-SESSION_START_HOUR_UTC = 6
-SESSION_END_HOUR_UTC = 20
+SESSION_START_HOUR_UTC = env_int("SESSION_START_HOUR_UTC", 6)
+SESSION_END_HOUR_UTC = env_int("SESSION_END_HOUR_UTC", 20)
 
-BIAS_EMA_PERIOD = 200
-H4_BAR_COUNT = 650
-M15_BAR_COUNT = 180
-M5_BAR_COUNT = 650
+BIAS_EMA_PERIOD = env_int("BIAS_EMA_PERIOD", 200)
+H4_BAR_COUNT = env_int("H4_BAR_COUNT", 650)
+M15_BAR_COUNT = env_int("M15_BAR_COUNT", 240)
+M5_BAR_COUNT = env_int("M5_BAR_COUNT", 650)
 
-HTF_SWING_WINDOW = 5
-LTF_SWING_WINDOW = 2
-STRUCTURE_SWING_WINDOW = 2
+HTF_SWING_WINDOW = env_int("HTF_SWING_WINDOW", 5)
+LTF_SWING_WINDOW = env_int("LTF_SWING_WINDOW", 2)
+STRUCTURE_SWING_WINDOW = env_int("STRUCTURE_SWING_WINDOW", 2)
 
-ZONE_LOOKBACK = 50
-DEALING_RANGE_BARS = 50
-OB_SEARCH_BACK = 4
-DISPLACEMENT_ATR = 1.0
-MIN_FVG_ATR = 0.05
+ZONE_LOOKBACK = env_int("ZONE_LOOKBACK", 50)
+DEALING_RANGE_BARS = env_int("DEALING_RANGE_BARS", 50)
+OB_SEARCH_BACK = env_int("OB_SEARCH_BACK", 4)
 
-LIQUIDITY_MAX_AGE = 30
-SWEEP_MIN_ATR = 0.25
-SWEEP_AFTER_TOUCH_BARS = 3
-CONFIRM_AFTER_SWEEP_BARS = 6
+DISPLACEMENT_ATR = env_float("DISPLACEMENT_ATR", 1.0)
+DISPLACEMENT_BODY_RATIO = env_float(
+    "DISPLACEMENT_BODY_RATIO", 0.60
+)
+MIN_FVG_ATR = env_float("MIN_FVG_ATR", 0.10)
+BOS_BUFFER_ATR = env_float("BOS_BUFFER_ATR", 0.05)
 
-SL_BUFFER_ATR = 0.30
-MAX_SL_ATR = 3.0
-MAX_ENTRY_DRIFT_ATR = 0.50
-TP1_RR = 1.5
-TP2_RR = 2.5
-TRAIL_ATR = 1.2
+REQUIRE_OB_FVG_CONFLUENCE = env_bool(
+    "REQUIRE_OB_FVG_CONFLUENCE", True
+)
 
-MAX_LOT = 5.0
-DEVIATION_POINTS = 20
-RISK_SLIPPAGE_POINTS = 20
+REQUIRE_FULL_ZONE_PD = env_bool("REQUIRE_FULL_ZONE_PD", True)
 
-MAX_TICK_AGE_SECONDS = 60
-MAX_CLOSED_M5_AGE_SECONDS = 420
+# Fraction of the frozen dealing range excluded around equilibrium.
+PD_EQUILIBRIUM_BUFFER = env_float(
+    "PD_EQUILIBRIUM_BUFFER", 0.02
+)
+
+MAX_ZONE_AGE_M15_BARS = env_int(
+    "MAX_ZONE_AGE_M15_BARS", 32
+)
+
+LIQUIDITY_MAX_AGE = env_int("LIQUIDITY_MAX_AGE", 30)
+SWEEP_MIN_ATR = env_float("SWEEP_MIN_ATR", 0.25)
+SWEEP_AFTER_TOUCH_BARS = env_int(
+    "SWEEP_AFTER_TOUCH_BARS", 3
+)
+CONFIRM_AFTER_SWEEP_BARS = env_int(
+    "CONFIRM_AFTER_SWEEP_BARS", 6
+)
+MAX_TOUCH_WAIT_BARS = env_int("MAX_TOUCH_WAIT_BARS", 9)
+
+CONFIRM_CLOSE_BUFFER_ATR = env_float(
+    "CONFIRM_CLOSE_BUFFER_ATR", 0.05
+)
+CONFIRM_MIN_BODY_ATR = env_float(
+    "CONFIRM_MIN_BODY_ATR", 0.10
+)
+
+# Stricter filtering; may substantially reduce trade frequency.
+REQUIRE_M15_CONFIRMATION = env_bool(
+    "REQUIRE_M15_CONFIRMATION", True
+)
+
+SL_BUFFER_ATR = env_float("SL_BUFFER_ATR", 0.30)
+MAX_SL_ATR = env_float("MAX_SL_ATR", 3.0)
+MAX_ENTRY_DRIFT_ATR = env_float("MAX_ENTRY_DRIFT_ATR", 0.50)
+
+TP1_RR = env_float("TP1_RR", 1.5)
+TP2_RR = env_float("TP2_RR", 2.5)
+TRAIL_ATR = env_float("TRAIL_ATR", 1.2)
+
+MAX_LOT = env_float("MAX_LOT", 5.0)
+DEVIATION_POINTS = env_int("DEVIATION_POINTS", 20)
+RISK_SLIPPAGE_POINTS = env_int("RISK_SLIPPAGE_POINTS", 20)
+
+MAX_TICK_AGE_SECONDS = env_float("MAX_TICK_AGE_SECONDS", 60)
+MAX_CLOSED_M5_AGE_SECONDS = env_float(
+    "MAX_CLOSED_M5_AGE_SECONDS", 420
+)
+
+# Optional position time stop.
+# Disabled until the operator tests suitable values.
+ENABLE_TIME_EXIT = env_bool("ENABLE_TIME_EXIT", False)
+TIME_EXIT_MINUTES = env_float("TIME_EXIT_MINUTES", 60)
+TIME_EXIT_MIN_R = env_float("TIME_EXIT_MIN_R", 0.25)
+
+# Optional local-calendar news filter.
+# When enabled, missing / stale / invalid calendar data blocks entries.
+ENABLE_NEWS_FILTER = env_bool("ENABLE_NEWS_FILTER", False)
+NEWS_FILE = ROOT / os.getenv(
+    "NEWS_FILE", "news_calendar.json"
+)
+NEWS_BEFORE_MINUTES = env_float("NEWS_BEFORE_MINUTES", 30)
+NEWS_AFTER_MINUTES = env_float("NEWS_AFTER_MINUTES", 30)
+NEWS_FILE_MAX_AGE_HOURS = env_float(
+    "NEWS_FILE_MAX_AGE_HOURS", 24
+)
+
 EPSILON = 1e-8
 
 MT5_HOST = os.getenv("MT5_HOST", "localhost").strip()
-MT5_PORT = int(os.getenv("MT5_PORT", "8002"))
-MT5_LOGIN = int(os.getenv("MT5_LOGIN", "0") or "0")
+MT5_PORT = env_int("MT5_PORT", 8002)
+MT5_LOGIN = env_int("MT5_LOGIN", 0)
 MT5_PASSWORD = os.getenv("MT5_PASSWORD", "")
 MT5_SERVER = os.getenv("MT5_SERVER", "")
 
@@ -161,10 +242,7 @@ def utc_now():
 
 def utc_midnight_timestamp():
     return utc_now().replace(
-        hour=0,
-        minute=0,
-        second=0,
-        microsecond=0,
+        hour=0, minute=0, second=0, microsecond=0
     ).timestamp()
 
 
@@ -182,8 +260,8 @@ def safe_text(text):
 
 
 def log(message):
-    timestamp = utc_now().strftime("%Y-%m-%d %H:%M:%S UTC")
-    print(f"[{timestamp}] {safe_text(message)}", flush=True)
+    stamp = utc_now().strftime("%Y-%m-%d %H:%M:%S UTC")
+    print(f"[{stamp}] {safe_text(message)}", flush=True)
 
 
 def notify(message):
@@ -203,13 +281,11 @@ def notify(message):
             },
             timeout=10,
         )
-
         if response.status_code != 200:
             log("Telegram delivery failed.")
             return
 
-        payload = response.json()
-        if not payload.get("ok", False):
+        if not response.json().get("ok", False):
             log("Telegram delivery was rejected.")
 
     except Exception:
@@ -218,34 +294,61 @@ def notify(message):
 
 def status(key, message, interval=300):
     now = time.time()
-    previous = LAST_STATUS.get(key, 0.0)
-    if now - previous >= interval:
+    if now - LAST_STATUS.get(key, 0.0) >= interval:
         LAST_STATUS[key] = now
         log(message)
 
 
 def validate_config():
     if not SYMBOLS or len(SYMBOLS) != len(set(SYMBOLS)):
-        raise FatalError("The symbol list is empty or contains duplicates.")
+        raise FatalError("The symbol list is empty or duplicated.")
 
     if any(
         re.fullmatch(r"[A-Za-z0-9._-]+", symbol) is None
         for symbol in SYMBOLS
     ):
-        raise FatalError("Symbol names must contain supported ASCII characters.")
+        raise FatalError("Unsupported symbol name.")
 
-    values = [
+    if not DRY_RUN and not ALLOW_LIVE_TRADING:
+        raise FatalError(
+            "Live mode requires ALLOW_LIVE_TRADING=true."
+        )
+
+    positive = [
         POLL_SECONDS,
         RISK_PER_TRADE,
         MAX_SPREAD_POINTS,
         MAX_LOT,
+        DISPLACEMENT_ATR,
+        MIN_FVG_ATR,
+        MAX_SL_ATR,
+        MAX_ENTRY_DRIFT_ATR,
+        TP1_RR,
+        TP2_RR,
+        TRAIL_ATR,
+        TIME_EXIT_MINUTES,
+        NEWS_FILE_MAX_AGE_HOURS,
+        MAX_TICK_AGE_SECONDS,
+        MAX_CLOSED_M5_AGE_SECONDS,
     ]
 
-    if any(not math.isfinite(value) or value <= 0 for value in values):
-        raise FatalError("Positive finite configuration values are required.")
+    if any(not math.isfinite(x) or x <= 0 for x in positive):
+        raise FatalError("Positive finite configuration is required.")
 
-    if not math.isfinite(COMMISSION_PER_LOT) or COMMISSION_PER_LOT < 0:
-        raise FatalError("Commission configuration is invalid.")
+    nonnegative = [
+        COMMISSION_PER_LOT,
+        BOS_BUFFER_ATR,
+        CONFIRM_CLOSE_BUFFER_ATR,
+        CONFIRM_MIN_BODY_ATR,
+        SL_BUFFER_ATR,
+        SWEEP_MIN_ATR,
+        NEWS_BEFORE_MINUTES,
+        NEWS_AFTER_MINUTES,
+        COOLDOWN_SECONDS,
+    ]
+
+    if any(not math.isfinite(x) or x < 0 for x in nonnegative):
+        raise FatalError("A nonnegative configuration is invalid.")
 
     if not isinstance(MAX_SPREAD_BY_SYMBOL, dict):
         raise FatalError("Spread overrides must be a JSON object.")
@@ -253,13 +356,63 @@ def validate_config():
     for value in MAX_SPREAD_BY_SYMBOL.values():
         number = float(value)
         if not math.isfinite(number) or number <= 0:
-            raise FatalError("A spread override is invalid.")
+            raise FatalError("Invalid spread override.")
+
+    integer_positive = [
+        MAX_OPEN_POSITIONS,
+        MAX_DAILY_TRADES,
+        MAX_CONSECUTIVE_LOSSES,
+        BIAS_EMA_PERIOD,
+        HTF_SWING_WINDOW,
+        LTF_SWING_WINDOW,
+        STRUCTURE_SWING_WINDOW,
+        ZONE_LOOKBACK,
+        DEALING_RANGE_BARS,
+        OB_SEARCH_BACK,
+        MAX_ZONE_AGE_M15_BARS,
+        LIQUIDITY_MAX_AGE,
+        CONFIRM_AFTER_SWEEP_BARS,
+        MAX_TOUCH_WAIT_BARS,
+    ]
+
+    if any(x <= 0 for x in integer_positive):
+        raise FatalError("Positive integer configuration is required.")
+
+    if SWEEP_AFTER_TOUCH_BARS < 0:
+        raise FatalError("Invalid sweep timeout.")
+
+    if DEVIATION_POINTS < 0 or RISK_SLIPPAGE_POINTS < 0:
+        raise FatalError("Invalid slippage configuration.")
 
     if not 0 < MAX_DAILY_LOSS_PCT < 1:
-        raise FatalError("The daily loss limit is invalid.")
+        raise FatalError("Invalid daily loss limit.")
 
-    if TP1_RR <= 0 or TP2_RR <= TP1_RR:
-        raise FatalError("Reward targets are invalid.")
+    if TP2_RR <= TP1_RR:
+        raise FatalError("TP2_RR must exceed TP1_RR.")
+
+    if not 0 < DISPLACEMENT_BODY_RATIO <= 1:
+        raise FatalError("Invalid displacement body ratio.")
+
+    if not 0 <= PD_EQUILIBRIUM_BUFFER < 0.5:
+        raise FatalError("Invalid equilibrium buffer.")
+
+    if not math.isfinite(TIME_EXIT_MIN_R):
+        raise FatalError("Invalid time exit threshold.")
+
+    if not (
+        0 <= SESSION_START_HOUR_UTC <= 23
+        and 0 <= SESSION_END_HOUR_UTC <= 23
+    ):
+        raise FatalError("Session hours must be between 0 and 23.")
+
+    if H4_BAR_COUNT < BIAS_EMA_PERIOD * 3 + 2:
+        raise FatalError("H4 history is too short.")
+
+    if M15_BAR_COUNT < DEALING_RANGE_BARS + ZONE_LOOKBACK + 10:
+        raise FatalError("M15 history is too short.")
+
+    if M5_BAR_COUNT < MAX_ZONE_AGE_M15_BARS * 3 + 50:
+        raise FatalError("M5 history is too short for zone validation.")
 
 
 def acquire_lock(account_key):
@@ -277,7 +430,9 @@ def acquire_lock(account_key):
             fcntl.LOCK_EX | fcntl.LOCK_NB,
         )
     except OSError:
-        raise FatalError("Another bot instance already holds the account lock.")
+        LOCK_HANDLE.close()
+        LOCK_HANDLE = None
+        raise FatalError("Another instance holds the account lock.")
 
 
 def release_lock():
@@ -289,7 +444,6 @@ def release_lock():
             LOCK_HANDLE.close()
         except Exception:
             pass
-
         LOCK_HANDLE = None
 
 
@@ -319,15 +473,17 @@ def atomic_save(path, state):
             os.close(directory_fd)
 
     except Exception:
-        raise FatalError("State persistence failed. Trading has stopped.")
+        raise FatalError("State persistence failed. Trading stopped.")
 
 
 def load_state(path, account_key):
+    expected_mode = "DRY_RUN" if DRY_RUN else "LIVE"
+
     if not path.exists():
         return {
             "version": STATE_VERSION,
             "account_key": account_key,
-            "mode": "DRY_RUN" if DRY_RUN else "LIVE",
+            "mode": expected_mode,
             "day": "",
             "day_start_balance": None,
             "daily_loss_latched": False,
@@ -337,21 +493,20 @@ def load_state(path, account_key):
             "seen_zones": {},
             "pending": None,
             "halt_reason": "",
+            "dry_run_entries": 0,
         }
 
     try:
         state = json.loads(path.read_text(encoding="ascii"))
     except Exception:
-        raise FatalError("The state file is unreadable. Trading has stopped.")
-
-    expected_mode = "DRY_RUN" if DRY_RUN else "LIVE"
+        raise FatalError("The state file is unreadable.")
 
     if (
         state.get("version") != STATE_VERSION
         or state.get("account_key") != account_key
         or state.get("mode") != expected_mode
     ):
-        raise FatalError("The state file does not match this account or mode.")
+        raise FatalError("The state file does not match account or mode.")
 
     required = {
         "positions",
@@ -369,10 +524,15 @@ def load_state(path, account_key):
         raise FatalError("The state file is incomplete.")
 
     if not isinstance(state["positions"], dict):
-        raise FatalError("Position state is invalid.")
+        raise FatalError("Invalid position state.")
 
     if not isinstance(state["seen_zones"], dict):
-        raise FatalError("Signal state is invalid.")
+        raise FatalError("Invalid signal state.")
+
+    state.setdefault("dry_run_entries", 0)
+
+    for record in state["positions"].values():
+        record.setdefault("last_sl", record["initial_sl"])
 
     return state
 
@@ -396,7 +556,7 @@ class Broker:
         return int(getattr(self.mt5, name))
 
     def read(self, expression):
-        """
+          """
         Serialize on the remote side to avoid retaining remote object proxies.
         """
         serialized = self.mt5._container.eval(
@@ -406,7 +566,7 @@ class Broker:
 
     def named(self, expression):
         result = self.read(
-            f"(lambda value: None if value is None "
+            "(lambda value: None if value is None "
             f"else value._asdict())({expression})"
         )
         if result is None:
@@ -415,8 +575,9 @@ class Broker:
 
     def records(self, expression):
         result = self.read(
-            f"(lambda values: None if values is None "
-            f"else [value._asdict() for value in values])({expression})"
+            "(lambda values: None if values is None "
+            "else [value._asdict() for value in values])"
+            f"({expression})"
         )
         if result is None:
             raise SafetyError("An MT5 collection query failed.")
@@ -433,14 +594,9 @@ class Broker:
 
     def tick(self, symbol):
         tick = self.named(f"mt5.symbol_info_tick({symbol!r})")
-
         bid = float(tick["bid"])
         ask = float(tick["ask"])
-        stamp = float(tick.get("time_msc", 0)) / 1000.0
-
-        if stamp <= 0:
-            stamp = float(tick["time"])
-
+        stamp = tick_timestamp(tick)
         age = time.time() - stamp
 
         if (
@@ -451,7 +607,7 @@ class Broker:
             or age > MAX_TICK_AGE_SECONDS
             or age < -5
         ):
-            raise SafetyError("A valid recent market tick is unavailable.")
+            raise SafetyError("A valid recent tick is unavailable.")
 
         return tick
 
@@ -468,18 +624,16 @@ class Broker:
 
     def history(self, start, end):
         module = "__import__('datetime')"
-
-        start_expr = (
+        first = (
             f"{module}.datetime.fromtimestamp("
             f"{float(start)}, tz={module}.timezone.utc)"
         )
-        end_expr = (
+        last = (
             f"{module}.datetime.fromtimestamp("
             f"{float(end)}, tz={module}.timezone.utc)"
         )
-
         return self.records(
-            f"mt5.history_deals_get({start_expr}, {end_expr})"
+            f"mt5.history_deals_get({first}, {last})"
         )
 
     def bars(self, symbol, timeframe, count):
@@ -491,7 +645,7 @@ class Broker:
             "'low': float(row['low']), "
             "'close': float(row['close'])} "
             "for row in values])"
-            f"(mt5.copy_rates_from_pos("
+            "(mt5.copy_rates_from_pos("
             f"{symbol!r}, {int(timeframe)}, 1, {int(count)}))"
         )
 
@@ -504,25 +658,28 @@ class Broker:
 
         for bar in values:
             if previous is not None and bar["time"] <= previous:
-                raise SafetyError("Market-bar timestamps are invalid.")
-
+                raise SafetyError("Invalid market-bar timestamps.")
             previous = bar["time"]
 
             numbers = [
-                bar["open"],
-                bar["high"],
-                bar["low"],
-                bar["close"],
+                bar["open"], bar["high"], bar["low"], bar["close"]
             ]
 
-            if any(not math.isfinite(value) or value <= 0 for value in numbers):
-                raise SafetyError("Market-bar prices are invalid.")
+            if any(
+                not math.isfinite(x) or x <= 0
+                for x in numbers
+            ):
+                raise SafetyError("Invalid market-bar prices.")
 
             if (
-                bar["high"] < max(bar["open"], bar["close"], bar["low"])
-                or bar["low"] > min(bar["open"], bar["close"], bar["high"])
+                bar["high"] < max(
+                    bar["open"], bar["close"], bar["low"]
+                )
+                or bar["low"] > min(
+                    bar["open"], bar["close"], bar["high"]
+                )
             ):
-                raise SafetyError("Market-bar ranges are invalid.")
+                raise SafetyError("Invalid market-bar ranges.")
 
         return values
 
@@ -546,35 +703,38 @@ class Broker:
 
     def profit(self, order_type, symbol, volume, entry, stop):
         value = self.read(
-            f"mt5.order_calc_profit("
+            "mt5.order_calc_profit("
             f"{int(order_type)}, {symbol!r}, {float(volume)}, "
             f"{float(entry)}, {float(stop)})"
         )
-
         if value is None or not math.isfinite(float(value)):
             raise SafetyError("Profit calculation is unavailable.")
-
         return float(value)
 
     def margin(self, order_type, symbol, volume, price):
         value = self.read(
-            f"mt5.order_calc_margin("
+            "mt5.order_calc_margin("
             f"{int(order_type)}, {symbol!r}, "
             f"{float(volume)}, {float(price)})"
         )
-
         if value is None or not math.isfinite(float(value)):
             raise SafetyError("Margin calculation is unavailable.")
-
         return float(value)
 
     def select_symbols(self):
         for symbol in SYMBOLS:
             if not self.read(f"mt5.symbol_select({symbol!r}, True)"):
-                raise FatalError("A configured symbol could not be selected.")
+                raise FatalError("A configured symbol cannot be selected.")
 
     def shutdown(self):
         self.mt5.shutdown()
+
+
+def tick_timestamp(tick):
+    stamp = float(tick.get("time_msc", 0)) / 1000.0
+    if stamp <= 0:
+        stamp = float(tick["time"])
+    return stamp
 
 
 def ema(values, period):
@@ -585,16 +745,14 @@ def ema(values, period):
     alpha = 2.0 / (period + 1.0)
 
     for value in values[1:]:
-        result.append(result[-1] + alpha * (float(value) - result[-1]))
+        result.append(
+            result[-1] + alpha * (float(value) - result[-1])
+        )
 
     return result
 
 
 def atr(bars, period=14):
-    """
-    Wilder-style recursive smoothing, initialized from the first range.
-    Sufficient warm-up bars are requested before signals are evaluated.
-    """
     result = []
 
     for index, bar in enumerate(bars):
@@ -620,9 +778,7 @@ def atr(bars, period=14):
 
 def swings(bars, window):
     """
-    Strict extrema only.
-
-    Each swing becomes available after its right-hand confirmation bars close.
+    A swing is available only after all right confirmation bars close.
     """
     highs = []
     lows = []
@@ -634,21 +790,17 @@ def swings(bars, window):
             + bars[index + 1:index + window + 1]
         )
 
-        if all(center["high"] > item["high"] for item in neighbors):
-            highs.append({
-                "index": index,
-                "confirmed_index": index + window,
-                "price": center["high"],
-                "time": center["time"],
-            })
+        item = {
+            "index": index,
+            "confirmed_index": index + window,
+            "time": center["time"],
+        }
 
-        if all(center["low"] < item["low"] for item in neighbors):
-            lows.append({
-                "index": index,
-                "confirmed_index": index + window,
-                "price": center["low"],
-                "time": center["time"],
-            })
+        if all(center["high"] > x["high"] for x in neighbors):
+            highs.append(dict(item, price=center["high"]))
+
+        if all(center["low"] < x["low"] for x in neighbors):
+            lows.append(dict(item, price=center["low"]))
 
     return highs, lows
 
@@ -664,34 +816,32 @@ def htf_bias(bars):
 
     close = bars[-1]["close"]
     average = ema(
-        [bar["close"] for bar in bars],
-        BIAS_EMA_PERIOD,
+        [bar["close"] for bar in bars], BIAS_EMA_PERIOD
     )[-1]
 
     bullish = (
         highs[-1]["price"] > highs[-2]["price"]
         and lows[-1]["price"] > lows[-2]["price"]
     )
-
     bearish = (
         highs[-1]["price"] < highs[-2]["price"]
         and lows[-1]["price"] < lows[-2]["price"]
     )
 
     if bullish and close > average:
-        protected_low = lows[-1]
+        pivot = lows[-1]
         broken = any(
-            bar["close"] < protected_low["price"]
-            for bar in bars[protected_low["index"] + 1:]
+            bar["close"] < pivot["price"]
+            for bar in bars[pivot["index"] + 1:]
         )
         if not broken:
             return "BUY"
 
     if bearish and close < average:
-        protected_high = highs[-1]
+        pivot = highs[-1]
         broken = any(
-            bar["close"] > protected_high["price"]
-            for bar in bars[protected_high["index"] + 1:]
+            bar["close"] > pivot["price"]
+            for bar in bars[pivot["index"] + 1:]
         )
         if not broken:
             return "SELL"
@@ -699,29 +849,139 @@ def htf_bias(bars):
     return "NEUTRAL"
 
 
+def first_structure_break(bars, index, side, volatility):
+    prior = bars[:index]
+    highs, lows = swings(prior, STRUCTURE_SWING_WINDOW)
+    buy = side == "BUY"
+    pivots = highs if buy else lows
+
+    if not pivots:
+        return None
+
+    pivot = pivots[-1]
+    level = pivot["price"]
+    close = bars[index]["close"]
+    buffer = BOS_BUFFER_ATR * volatility
+
+    # A previous close beyond the raw pivot consumes the first break.
+    intervening = bars[pivot["confirmed_index"] + 1:index]
+
+    if buy:
+        valid = (
+            close > level + buffer
+            and all(bar["close"] <= level for bar in intervening)
+        )
+    else:
+        valid = (
+            close < level - buffer
+            and all(bar["close"] >= level for bar in intervening)
+        )
+
+    return pivot if valid else None
+
+
 def create_zones(bars, side):
     """
-    Return historical zone candidates without deleting their first touch.
+    The impulse is the middle candle of a three-candle FVG.
 
-    Freshness and invalidation are evaluated later on the M5 timeline.
-    Zone creation time is the close of the final required M15 candle.
+    OB/FVG zones from that impulse become available only when the
+    third candle closes. Confluence means the same impulse, not
+    necessarily geometric overlap between OB and FVG.
     """
     volatility = atr(bars)
+    buy = side == "BUY"
     result = []
-    first = max(DEALING_RANGE_BARS, len(bars) - ZONE_LOOKBACK)
 
-    for index in range(first, len(bars)):
-        bar = bars[index]
-        prior = bars[:index]
-        previous_atr = volatility[index - 1]
+    first = max(
+        DEALING_RANGE_BARS + 1,
+        len(bars) - ZONE_LOOKBACK,
+    )
 
-        if previous_atr <= 0:
+    for final_index in range(first, len(bars)):
+        impulse_index = final_index - 1
+
+        if impulse_index < DEALING_RANGE_BARS:
             continue
 
-        dealing = bars[index - DEALING_RANGE_BARS:index]
-        range_high = max(item["high"] for item in dealing)
-        range_low = min(item["low"] for item in dealing)
+        impulse = bars[impulse_index]
+        left = bars[final_index - 2]
+        right = bars[final_index]
+        reference_atr = volatility[impulse_index - 1]
+
+        if reference_atr <= 0:
+            continue
+
+        body = abs(impulse["close"] - impulse["open"])
+        candle_range = impulse["high"] - impulse["low"]
+
+        directional = (
+            impulse["close"] > impulse["open"]
+            if buy
+            else impulse["close"] < impulse["open"]
+        )
+
+        if (
+            not directional
+            or candle_range <= 0
+            or body < DISPLACEMENT_ATR * reference_atr
+            or body / candle_range < DISPLACEMENT_BODY_RATIO
+        ):
+            continue
+
+        pivot = first_structure_break(
+            bars, impulse_index, side, reference_atr
+        )
+
+        if pivot is None:
+            continue
+
+        if buy:
+            gap_bottom = left["high"]
+            gap_top = right["low"]
+        else:
+            gap_bottom = right["high"]
+            gap_top = left["low"]
+
+        gap_valid = (
+            gap_top - gap_bottom >= MIN_FVG_ATR * reference_atr
+        )
+
+        ob_index = None
+
+        for source in range(
+            impulse_index - 1,
+            max(-1, impulse_index - OB_SEARCH_BACK - 1),
+            -1,
+        ):
+            source_bar = bars[source]
+            opposite = (
+                source_bar["close"] < source_bar["open"]
+                if buy
+                else source_bar["close"] > source_bar["open"]
+            )
+
+            if opposite:
+                ob_index = source
+                break
+
+        if REQUIRE_OB_FVG_CONFLUENCE:
+            if ob_index is None or not gap_valid:
+                continue
+
+        dealing = bars[
+            impulse_index - DEALING_RANGE_BARS:impulse_index
+        ]
+
+        range_high = max(bar["high"] for bar in dealing)
+        range_low = min(bar["low"] for bar in dealing)
+        width = range_high - range_low
+
+        if width <= 0:
+            continue
+
         equilibrium = (range_high + range_low) / 2.0
+        pd_buffer = width * PD_EQUILIBRIUM_BUFFER
+        created = int(right["time"] + 900)
 
         def add_zone(kind, bottom, top, source_index):
             if bottom >= top:
@@ -729,133 +989,65 @@ def create_zones(bars, side):
 
             midpoint = (bottom + top) / 2.0
 
-            if side == "BUY" and midpoint > equilibrium:
-                return
+            if buy:
+                tested = top if REQUIRE_FULL_ZONE_PD else midpoint
+                if tested > equilibrium - pd_buffer:
+                    return
+            else:
+                tested = bottom if REQUIRE_FULL_ZONE_PD else midpoint
+                if tested < equilibrium + pd_buffer:
+                    return
 
-            if side == "SELL" and midpoint < equilibrium:
-                return
+            # Reject OBs already breached before availability.
+            if kind == "OB":
+                path = bars[source_index + 1:final_index + 1]
+                if buy and any(
+                    bar["low"] < bottom for bar in path
+                ):
+                    return
+                if not buy and any(
+                    bar["high"] > top for bar in path
+                ):
+                    return
+
+            key = (
+                f"{side}:{kind}:{bars[source_index]['time']}:"
+                f"{created}"
+            )
 
             result.append({
                 "kind": kind,
                 "side": side,
                 "bottom": float(bottom),
                 "top": float(top),
-                "created": int(bar["time"] + 900),
+                "created": created,
                 "source_time": int(bars[source_index]["time"]),
+                "local_id": key,
+                "equilibrium": float(equilibrium),
+                "range_high": float(range_high),
+                "range_low": float(range_low),
+                "bos_level": float(pivot["price"]),
+                "impulse_time": int(impulse["time"]),
+                "confluence": bool(
+                    ob_index is not None and gap_valid
+                ),
             })
 
-        highs, lows = swings(prior, STRUCTURE_SWING_WINDOW)
-        body = abs(bar["close"] - bar["open"])
+        if ob_index is not None:
+            source_bar = bars[ob_index]
+            add_zone(
+                "OB",
+                source_bar["low"],
+                source_bar["high"],
+                ob_index,
+            )
 
-        if body >= DISPLACEMENT_ATR * previous_atr:
-            if (
-                side == "BUY"
-                and highs
-                and bar["close"] > bar["open"]
-            ):
-                pivot = highs[-1]
+        if gap_valid:
+            add_zone(
+                "FVG", gap_bottom, gap_top, impulse_index
+            )
 
-                first_break = (
-                    bar["close"] > pivot["price"]
-                    and all(
-                        item["close"] <= pivot["price"]
-                        for item in bars[
-                            pivot["confirmed_index"] + 1:index
-                        ]
-                    )
-                )
-
-                if first_break:
-                    for source in range(
-                        index - 1,
-                        max(-1, index - OB_SEARCH_BACK - 1),
-                        -1,
-                    ):
-                        source_bar = bars[source]
-
-                        if source_bar["close"] < source_bar["open"]:
-                            add_zone(
-                                "OB",
-                                source_bar["low"],
-                                source_bar["high"],
-                                source,
-                            )
-                            break
-
-            if (
-                side == "SELL"
-                and lows
-                and bar["close"] < bar["open"]
-            ):
-                pivot = lows[-1]
-
-                first_break = (
-                    bar["close"] < pivot["price"]
-                    and all(
-                        item["close"] >= pivot["price"]
-                        for item in bars[
-                            pivot["confirmed_index"] + 1:index
-                        ]
-                    )
-                )
-
-                if first_break:
-                    for source in range(
-                        index - 1,
-                        max(-1, index - OB_SEARCH_BACK - 1),
-                        -1,
-                    ):
-                        source_bar = bars[source]
-
-                        if source_bar["close"] > source_bar["open"]:
-                            add_zone(
-                                "OB",
-                                source_bar["low"],
-                                source_bar["high"],
-                                source,
-                            )
-                            break
-
-        if index >= 2:
-            first_bar = bars[index - 2]
-            middle_bar = bars[index - 1]
-
-            if side == "BUY":
-                gap = bar["low"] - first_bar["high"]
-
-                if (
-                    gap >= MIN_FVG_ATR * previous_atr
-                    and middle_bar["close"] > middle_bar["open"]
-                ):
-                    add_zone(
-                        "FVG",
-                        first_bar["high"],
-                        bar["low"],
-                        index - 1,
-                    )
-
-            else:
-                gap = first_bar["low"] - bar["high"]
-
-                if (
-                    gap >= MIN_FVG_ATR * previous_atr
-                    and middle_bar["close"] < middle_bar["open"]
-                ):
-                    add_zone(
-                        "FVG",
-                        bar["high"],
-                        first_bar["low"],
-                        index - 1,
-                    )
-
-    unique = {}
-
-    for zone in result:
-        key = (
-            f"{side}:{zone['kind']}:"
-            f"{zone['source_time']}:{zone['created']}"
-        )
-        unique[key] = dict(zone, local_id=key)
+    unique = {zone["local_id"]: zone for zone in result}
 
     return sorted(
         unique.values(),
@@ -865,19 +1057,19 @@ def create_zones(bars, side):
 
 
 def zone_signal(zone, bars, volatility):
-    """
-    Require:
-    1. A first touch after zone creation.
-    2. A sweep on the touch bar or up to three bars later.
-    3. A later close through a confirmed pre-sweep opposing swing.
-
-    A sweep and confirmation on the same candle are not accepted.
-    """
-    if bars[0]["time"] > zone["created"]:
+    if not bars or bars[0]["time"] > zone["created"]:
         return None
 
-    side = zone["side"]
-    buy = side == "BUY"
+    latest = len(bars) - 1
+    decision_time = bars[-1]["time"] + 300
+
+    if (
+        decision_time - zone["created"]
+        > MAX_ZONE_AGE_M15_BARS * 900
+    ):
+        return None
+
+    buy = zone["side"] == "BUY"
 
     eligible = [
         index
@@ -893,6 +1085,7 @@ def zone_signal(zone, bars, volatility):
     for index in eligible:
         bar = bars[index]
 
+        # A full jump through the zone also consumes its freshness.
         reached = (
             bar["low"] <= zone["top"]
             if buy
@@ -906,11 +1099,7 @@ def zone_signal(zone, bars, volatility):
     if touch is None or touch < 40:
         return None
 
-    latest = len(bars) - 1
-
-    if latest - touch > (
-        SWEEP_AFTER_TOUCH_BARS + CONFIRM_AFTER_SWEEP_BARS
-    ):
+    if latest - touch > MAX_TOUCH_WAIT_BARS:
         return None
 
     for bar in bars[touch:]:
@@ -932,9 +1121,9 @@ def zone_signal(zone, bars, volatility):
             continue
 
         sweep_bar = bars[sweep_index]
-        previous_atr = volatility[sweep_index - 1]
+        reference_atr = volatility[sweep_index - 1]
 
-        if previous_atr <= 0:
+        if reference_atr <= 0:
             continue
 
         overlaps = (
@@ -966,15 +1155,15 @@ def zone_signal(zone, bars, volatility):
         if sweep_index - liquidity["index"] > LIQUIDITY_MAX_AGE:
             continue
 
-        after_liquidity = bars[
+        intervening = bars[
             liquidity["confirmed_index"] + 1:sweep_index
         ]
 
         already_taken = any(
-            item["low"] <= liquidity["price"]
+            bar["low"] <= liquidity["price"]
             if buy
-            else item["high"] >= liquidity["price"]
-            for item in after_liquidity
+            else bar["high"] >= liquidity["price"]
+            for bar in intervening
         )
 
         if already_taken:
@@ -983,13 +1172,13 @@ def zone_signal(zone, bars, volatility):
         if buy:
             swept = (
                 sweep_bar["low"]
-                < liquidity["price"] - SWEEP_MIN_ATR * previous_atr
+                < liquidity["price"] - SWEEP_MIN_ATR * reference_atr
                 and sweep_bar["close"] > liquidity["price"]
             )
         else:
             swept = (
                 sweep_bar["high"]
-                > liquidity["price"] + SWEEP_MIN_ATR * previous_atr
+                > liquidity["price"] + SWEEP_MIN_ATR * reference_atr
                 and sweep_bar["close"] < liquidity["price"]
             )
 
@@ -998,16 +1187,17 @@ def zone_signal(zone, bars, volatility):
 
         level = confirmation["price"]
 
-        broken_before_confirmation = any(
-            item["close"] > level
+        # The raw opposing level must not already have been closed through.
+        broken_before = any(
+            bar["close"] > level
             if buy
-            else item["close"] < level
-            for item in bars[
+            else bar["close"] < level
+            for bar in bars[
                 confirmation["confirmed_index"] + 1:sweep_index + 1
             ]
         )
 
-        if broken_before_confirmation:
+        if broken_before:
             continue
 
         confirmation_end = min(
@@ -1016,23 +1206,42 @@ def zone_signal(zone, bars, volatility):
         )
 
         for confirmation_index in range(
-            sweep_index + 1,
-            confirmation_end + 1,
+            sweep_index + 1, confirmation_end + 1
         ):
-            confirmed = (
-                bars[confirmation_index]["close"] > level
+            bar = bars[confirmation_index]
+            raw_break = (
+                bar["close"] > level
                 if buy
-                else bars[confirmation_index]["close"] < level
+                else bar["close"] < level
             )
 
-            if not confirmed:
+            if not raw_break:
                 continue
 
+            # Evaluate the first raw close-through only.
+            # Weak first breaks do not become fresh later entries.
             if confirmation_index != latest:
                 break
 
-            path = bars[touch:confirmation_index + 1]
+            reference = volatility[confirmation_index - 1]
+            close_buffer = CONFIRM_CLOSE_BUFFER_ATR * reference
+            body = abs(bar["close"] - bar["open"])
 
+            strong_close = (
+                bar["close"] > level + close_buffer
+                and bar["close"] > bar["open"]
+                if buy
+                else bar["close"] < level - close_buffer
+                and bar["close"] < bar["open"]
+            )
+
+            if (
+                not strong_close
+                or body < CONFIRM_MIN_BODY_ATR * reference
+            ):
+                break
+
+            path = bars[touch:confirmation_index + 1]
             extreme = (
                 min(item["low"] for item in path)
                 if buy
@@ -1041,23 +1250,198 @@ def zone_signal(zone, bars, volatility):
 
             return {
                 "zone": zone,
-                "side": side,
+                "side": zone["side"],
                 "extreme": extreme,
                 "atr": volatility[-1],
-                "signal_close": bars[-1]["close"],
-                "signal_time": int(bars[-1]["time"] + 300),
+                "signal_close": bar["close"],
+                "signal_time": int(bar["time"] + 300),
                 "sweep_time": int(sweep_bar["time"] + 300),
+                "sweep_open_time": int(sweep_bar["time"]),
                 "confirmation_level": level,
             }
 
     return None
 
 
+def m15_confirmation(candidate, bars):
+    """
+    Require a completed M15 candle after the sweep to close through
+    an opposing M15 swing that was already known before the sweep.
+
+    This is an additional filter, not a deferred-entry state machine.
+    """
+    if not REQUIRE_M15_CONFIRMATION:
+        return True
+
+    sweep_open = candidate["sweep_open_time"]
+
+    before = [
+        bar
+        for bar in bars
+        if bar["time"] + 900 <= sweep_open
+    ]
+
+    highs, lows = swings(before, STRUCTURE_SWING_WINDOW)
+    buy = candidate["side"] == "BUY"
+    pivots = highs if buy else lows
+
+    if not pivots:
+        return False
+
+    pivot = pivots[-1]
+    level = pivot["price"]
+
+    if any(
+        bar["close"] > level
+        if buy
+        else bar["close"] < level
+        for bar in before[pivot["confirmed_index"] + 1:]
+    ):
+        return False
+
+    if not bars:
+        return False
+
+    latest = bars[-1]
+
+    if latest["time"] + 900 < candidate["sweep_time"]:
+        return False
+
+    volatility = atr(bars)
+
+    if len(volatility) < 2 or volatility[-2] <= 0:
+        return False
+
+    buffer = BOS_BUFFER_ATR * volatility[-2]
+
+    if buy:
+        return (
+            latest["close"] > level + buffer
+            and latest["close"] > latest["open"]
+        )
+
+    return (
+        latest["close"] < level - buffer
+        and latest["close"] < latest["open"]
+    )
+
+
+def parse_utc_timestamp(value):
+    if not isinstance(value, str):
+        raise ValueError("UTC timestamp must be a string.")
+
+    stamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+    if stamp.tzinfo is None:
+        raise ValueError("Timezone-aware timestamp required.")
+
+    return stamp.astimezone(timezone.utc).timestamp()
+
+
+def news_permission(broker, symbol):
+    if not ENABLE_NEWS_FILTER:
+        return True, "News filter disabled."
+
+    try:
+        now = time.time()
+
+        file_age = now - NEWS_FILE.stat().st_mtime
+        if (
+            file_age < -5
+            or file_age > NEWS_FILE_MAX_AGE_HOURS * 3600
+        ):
+            return False, "News calendar is stale."
+
+        payload = json.loads(
+            NEWS_FILE.read_text(encoding="utf-8")
+        )
+
+        if not isinstance(payload, dict):
+            return False, "News calendar format is invalid."
+
+        valid_from = parse_utc_timestamp(payload["valid_from"])
+        valid_until = parse_utc_timestamp(payload["valid_until"])
+
+        # Coverage must include the entire relevant event window.
+        earliest_event = now - NEWS_AFTER_MINUTES * 60
+        latest_event = now + NEWS_BEFORE_MINUTES * 60
+
+        if (
+            valid_from > earliest_event
+            or valid_until < latest_event
+            or valid_until <= valid_from
+        ):
+            return False, "News calendar coverage is insufficient."
+
+        events = payload["events"]
+
+        if not isinstance(events, list):
+            return False, "News event list is invalid."
+
+        info = broker.info(symbol)
+        currencies = {
+            str(info.get("currency_base", "")).upper(),
+            str(info.get("currency_profit", "")).upper(),
+        }
+        currencies.discard("")
+
+        for event in events:
+            if not isinstance(event, dict):
+                return False, "News event format is invalid."
+
+            event_time = parse_utc_timestamp(event["time"])
+            impact = str(event["impact"]).lower()
+
+            if impact not in {"low", "medium", "high"}:
+                return False, "News impact value is invalid."
+
+            event_symbols = event.get("symbols", [])
+            event_currencies = event.get("currencies", [])
+
+            if (
+                not isinstance(event_symbols, list)
+                or not isinstance(event_currencies, list)
+                or any(
+                    not isinstance(item, str)
+                    for item in event_symbols + event_currencies
+                )
+            ):
+                return False, "News matching fields are invalid."
+
+            if impact != "high":
+                continue
+
+            targets = {item.upper() for item in event_currencies}
+
+            # An event without targeting fields applies to all symbols.
+            relevant = (
+                not event_symbols and not event_currencies
+            ) or (
+                symbol in event_symbols
+                or bool(currencies & targets)
+            )
+
+            if not relevant:
+                continue
+
+            if (
+                event_time - NEWS_BEFORE_MINUTES * 60
+                <= now
+                <= event_time + NEWS_AFTER_MINUTES * 60
+            ):
+                return False, "A high-impact news blackout is active."
+
+        return True, "News checks passed."
+
+    except SafetyError:
+        raise
+    except Exception:
+        return False, "News calendar is missing or invalid."
+
+
 def scan_symbol(broker, symbol, state):
     m5 = broker.bars(
-        symbol,
-        broker.constant("TIMEFRAME_M5"),
-        M5_BAR_COUNT,
+        symbol, broker.constant("TIMEFRAME_M5"), M5_BAR_COUNT
     )
 
     decision_time = int(m5[-1]["time"] + 300)
@@ -1067,22 +1451,17 @@ def scan_symbol(broker, symbol, state):
         return None
 
     h4 = broker.bars(
-        symbol,
-        broker.constant("TIMEFRAME_H4"),
-        H4_BAR_COUNT,
+        symbol, broker.constant("TIMEFRAME_H4"), H4_BAR_COUNT
     )
-
     m15 = broker.bars(
-        symbol,
-        broker.constant("TIMEFRAME_M15"),
-        M15_BAR_COUNT,
+        symbol, broker.constant("TIMEFRAME_M15"), M15_BAR_COUNT
     )
 
+    # Align all higher-timeframe information to the M5 decision time.
     h4 = [
         bar for bar in h4
         if bar["time"] + 14400 <= decision_time
     ]
-
     m15 = [
         bar for bar in m15
         if bar["time"] + 900 <= decision_time
@@ -1103,10 +1482,15 @@ def scan_symbol(broker, symbol, state):
 
         candidate = zone_signal(zone, m5, volatility)
 
-        if candidate:
-            candidate["symbol"] = symbol
-            candidate["zone_id"] = zone_id
-            return candidate
+        if candidate is None:
+            continue
+
+        if not m15_confirmation(candidate, m15):
+            continue
+
+        candidate["symbol"] = symbol
+        candidate["zone_id"] = zone_id
+        return candidate
 
     return None
 
@@ -1117,11 +1501,9 @@ def floor_volume(volume, step):
 
     number = Decimal(str(volume))
     increment = Decimal(str(step))
-
     units = (number / increment).to_integral_value(
         rounding=ROUND_FLOOR
     )
-
     return float(units * increment)
 
 
@@ -1140,19 +1522,18 @@ def price_round(price, info, upward=False):
     else:
         units = math.floor(units + 1e-9)
 
-    return round(
-        units * increment,
-        int(info["digits"]),
-    )
+    return round(units * increment, int(info["digits"]))
 
 
 def spread_points(tick, info):
     point = float(info["point"])
 
     if point <= 0:
-        raise SafetyError("The symbol point size is invalid.")
+        raise SafetyError("Invalid symbol point size.")
 
-    return (float(tick["ask"]) - float(tick["bid"])) / point
+    return (
+        float(tick["ask"]) - float(tick["bid"])
+    ) / point
 
 
 def choose_filling(broker, info):
@@ -1177,8 +1558,7 @@ def stop_gap(info, include_freeze=False):
 
     if include_freeze:
         points = max(
-            points,
-            float(info.get("trade_freeze_level", 0)),
+            points, float(info.get("trade_freeze_level", 0))
         )
 
     tick_size = float(
@@ -1192,8 +1572,25 @@ def build_order(broker, candidate, account):
     symbol = candidate["symbol"]
     buy = candidate["side"] == "BUY"
 
+    allowed, reason = news_permission(broker, symbol)
+
+    if not allowed:
+        status(f"news_{symbol}", f"{symbol}: {reason}", 60)
+        return None
+
     info = broker.info(symbol)
     tick = broker.tick(symbol)
+
+    if tick_timestamp(tick) < candidate["signal_time"]:
+        return None
+
+    signal_age = time.time() - candidate["signal_time"]
+
+    if (
+        signal_age < 0
+        or signal_age > MAX_CLOSED_M5_AGE_SECONDS
+    ):
+        return None
 
     allowed_modes = {
         broker.constant("SYMBOL_TRADE_MODE_FULL"),
@@ -1231,24 +1628,18 @@ def build_order(broker, candidate, account):
     gap = stop_gap(info)
 
     if buy:
-        raw_sl = min(
-            zone["bottom"],
-            candidate["extreme"],
-        ) - buffer
-
+        raw_sl = min(zone["bottom"], candidate["extreme"]) - buffer
         raw_sl = min(raw_sl, float(tick["bid"]) - gap)
         stop = price_round(raw_sl, info)
         risk_distance = entry - stop
         order_type = broker.constant("ORDER_TYPE_BUY")
-
     else:
         spread_price = float(tick["ask"]) - float(tick["bid"])
-
-        raw_sl = max(
-            zone["top"],
-            candidate["extreme"],
-        ) + buffer + spread_price
-
+        raw_sl = (
+            max(zone["top"], candidate["extreme"])
+            + buffer
+            + spread_price
+        )
         raw_sl = max(raw_sl, float(tick["ask"]) + gap)
         stop = price_round(raw_sl, info, upward=True)
         risk_distance = stop - entry
@@ -1282,9 +1673,7 @@ def build_order(broker, candidate, account):
     if target <= 0:
         return None
 
-    point = float(info["point"])
-    allowance = RISK_SLIPPAGE_POINTS * point
-
+    allowance = RISK_SLIPPAGE_POINTS * float(info["point"])
     worse_entry = entry + allowance if buy else entry - allowance
     worse_stop = stop - allowance if buy else stop + allowance
 
@@ -1300,11 +1689,7 @@ def build_order(broker, candidate, account):
 
     reference_loss = abs(
         broker.profit(
-            order_type,
-            symbol,
-            minimum,
-            worse_entry,
-            worse_stop,
+            order_type, symbol, minimum, worse_entry, worse_stop
         )
     ) + COMMISSION_PER_LOT * minimum
 
@@ -1323,11 +1708,7 @@ def build_order(broker, candidate, account):
 
     estimated_loss = abs(
         broker.profit(
-            order_type,
-            symbol,
-            volume,
-            worse_entry,
-            worse_stop,
+            order_type, symbol, volume, worse_entry, worse_stop
         )
     ) + COMMISSION_PER_LOT * volume
 
@@ -1336,7 +1717,7 @@ def build_order(broker, candidate, account):
 
     margin = broker.margin(order_type, symbol, volume, entry)
 
-    if margin > float(account["margin_free"]) * 0.90:
+    if margin < 0 or margin > float(account["margin_free"]) * 0.90:
         return None
 
     request = {
@@ -1408,8 +1789,9 @@ def rejection_is_definite(broker, result):
         "TRADE_RETCODE_INVALID_FILL",
     ]
 
-    codes = {broker.constant(name) for name in names}
-    return int(result["retcode"]) in codes
+    return int(result["retcode"]) in {
+        broker.constant(name) for name in names
+    }
 
 
 def mark_halt(state, path, reason):
@@ -1420,11 +1802,11 @@ def mark_halt(state, path, reason):
 
 
 def execute_request(broker, state, path, kind, request, metadata):
-    if DRY_RUN:
-        raise FatalError("A trading request was blocked by dry-run mode.")
+    if DRY_RUN or not ALLOW_LIVE_TRADING:
+        raise FatalError("A trading request was blocked by execution mode.")
 
     if state["pending"] is not None or state["halt_reason"]:
-        raise SafetyError("Another execution requires reconciliation.")
+        raise SafetyError("An execution requires reconciliation.")
 
     token = "SMC" + uuid.uuid4().hex[:18]
     request = dict(request, comment=token)
@@ -1471,18 +1853,14 @@ def resolve_pending(broker, state, path):
     kind = pending["kind"]
     result = pending.get("result") or {}
 
-    active_orders = broker.orders()
-
-    order_still_active = any(
+    if any(
         str(order.get("comment", "")) == request["comment"]
         or (
             int(result.get("order", 0)) > 0
             and int(order["ticket"]) == int(result["order"])
         )
-        for order in active_orders
-    )
-
-    if order_still_active:
+        for order in broker.orders()
+    ):
         return
 
     positions = broker.positions()
@@ -1505,7 +1883,11 @@ def resolve_pending(broker, state, path):
 
         current_sl = float(position["sl"])
         desired_sl = float(request["sl"])
-        buy = int(position["type"]) == broker.constant("POSITION_TYPE_BUY")
+        buy = (
+            int(position["type"])
+            == broker.constant("POSITION_TYPE_BUY")
+        )
+
         info = broker.info(position["symbol"])
         tolerance = float(
             info.get("trade_tick_size") or info["point"]
@@ -1518,28 +1900,30 @@ def resolve_pending(broker, state, path):
         )
 
         if satisfied:
+            record = state["positions"].get(pid)
+            if record is not None:
+                record["last_sl"] = current_sl
+
             state["pending"] = None
             atomic_save(path, state)
             notify(f"Stop update confirmed. Symbol: {position['symbol']}")
             return
 
-    else:
+    elif kind in {"ENTRY", "PARTIAL", "FULL_CLOSE"}:
         if kind == "ENTRY":
             deals = broker.history(
-                pending["created"] - 120,
-                time.time() + 1,
+                pending["created"] - 120, time.time() + 1
             )
-            wanted_entry = broker.constant("DEAL_ENTRY_IN")
 
             matches = [
                 deal for deal in deals
                 if trade_deal(broker, deal)
                 and int(deal.get("magic", 0)) == MAGIC
-                and int(deal.get("entry", -1)) == wanted_entry
+                and int(deal.get("entry", -1))
+                == broker.constant("DEAL_ENTRY_IN")
                 and deal_matches(deal, pending)
             ]
-
-        elif kind == "PARTIAL":
+        else:
             pid = pending["metadata"]["position_id"]
             deals = broker.position_deals(pid)
 
@@ -1555,9 +1939,6 @@ def resolve_pending(broker, state, path):
                 and deal_matches(deal, pending)
             ]
 
-        else:
-            raise FatalError("The execution journal contains an unknown action.")
-
         if matches:
             if kind == "ENTRY":
                 identifiers = {
@@ -1567,8 +1948,7 @@ def resolve_pending(broker, state, path):
 
                 if len(identifiers) != 1:
                     mark_halt(
-                        state,
-                        path,
+                        state, path,
                         "An entry affected multiple position identifiers.",
                     )
                     return
@@ -1591,13 +1971,14 @@ def resolve_pending(broker, state, path):
                     for deal in entries
                 ):
                     mark_halt(
-                        state,
-                        path,
+                        state, path,
                         "Position ownership could not be verified.",
                     )
                     return
 
-                volume = sum(float(deal["volume"]) for deal in entries)
+                volume = sum(
+                    float(deal["volume"]) for deal in entries
+                )
 
                 if volume <= 0:
                     return
@@ -1618,6 +1999,7 @@ def resolve_pending(broker, state, path):
                     "side": side,
                     "entry": entry,
                     "initial_sl": stop,
+                    "last_sl": stop,
                     "initial_risk": initial_risk,
                     "initial_volume": volume,
                     "initial_tp": float(request["tp"]),
@@ -1642,8 +2024,7 @@ def resolve_pending(broker, state, path):
 
                 if initial_risk <= 0:
                     mark_halt(
-                        state,
-                        path,
+                        state, path,
                         "The confirmed fill has invalid initial stop geometry.",
                     )
                     return
@@ -1660,31 +2041,63 @@ def resolve_pending(broker, state, path):
 
                 if actual_risk > RISK_PER_TRADE + EPSILON:
                     mark_halt(
-                        state,
-                        path,
+                        state, path,
                         "Confirmed entry risk exceeds the configured budget.",
                     )
 
-            else:
-                pid = pending["metadata"]["position_id"]
-                record = state["positions"].get(pid)
+                return
 
+            pid = pending["metadata"]["position_id"]
+            closed_volume = sum(
+                float(deal["volume"]) for deal in matches
+            )
+
+            if kind == "PARTIAL":
+                record = state["positions"].get(pid)
                 if record is not None:
                     record["partial_done"] = True
 
                 state["pending"] = None
                 atomic_save(path, state)
 
-                closed_volume = sum(
-                    float(deal["volume"]) for deal in matches
-                )
-
                 notify(
                     f"Partial close confirmed. Symbol: {request['symbol']}\n"
                     f"Closed volume: {closed_volume:.8f}"
                 )
+                return
 
+            # For a full exit, wait until all reported fills are visible
+            # and the position is either gone or demonstrably reduced.
+            remaining_position = next(
+                (
+                    item for item in positions
+                    if position_identifier(item) == pid
+                ),
+                None,
+            )
+
+            requested_volume = float(request["volume"])
+
+            if remaining_position is not None:
+                remaining = float(remaining_position["volume"])
+                expected_remaining = max(
+                    0.0, requested_volume - closed_volume
+                )
+
+                if remaining > expected_remaining + EPSILON:
+                    return
+
+            state["pending"] = None
+            atomic_save(path, state)
+
+            notify(
+                f"Time-exit fill confirmed. Symbol: {request['symbol']}\n"
+                f"Closed volume: {closed_volume:.8f}"
+            )
             return
+
+    else:
+        raise FatalError("Unknown execution journal action.")
 
     if rejection_is_definite(broker, pending.get("result")):
         code = int(pending["result"]["retcode"])
@@ -1695,7 +2108,7 @@ def resolve_pending(broker, state, path):
 
     status(
         "pending_execution",
-        "Execution remains unresolved. Automatic trading requests are blocked.",
+        "Execution remains unresolved. Automatic requests are blocked.",
     )
 
 
@@ -1728,8 +2141,7 @@ def reconcile_positions(broker, state, path):
                 and pid not in state["positions"]
             ):
                 mark_halt(
-                    state,
-                    path,
+                    state, path,
                     "An untracked bot position requires manual reconciliation.",
                 )
 
@@ -1739,46 +2151,71 @@ def reconcile_positions(broker, state, path):
         pending_pid = state["pending"]["metadata"].get("position_id")
 
     closed = []
+    updated = False
 
     for pid, record in list(state["positions"].items()):
         if pid in live:
             position = live[pid]
-
-            if int(position.get("magic", 0)) != MAGIC:
-                mark_halt(
-                    state,
-                    path,
-                    "Tracked position ownership changed.",
-                )
-
             buy = record["side"] == "BUY"
             actual_buy = (
                 int(position["type"])
                 == broker.constant("POSITION_TYPE_BUY")
             )
 
-            if actual_buy != buy:
+            if (
+                int(position.get("magic", 0)) != MAGIC
+                or position["symbol"] != record["symbol"]
+                or actual_buy != buy
+            ):
                 mark_halt(
-                    state,
-                    path,
-                    "Tracked position direction changed.",
-                )
-
-            if float(position["sl"]) <= 0:
-                mark_halt(
-                    state,
-                    path,
-                    "A tracked position has no server-side stop loss.",
+                    state, path,
+                    "Tracked position ownership or direction changed.",
                 )
 
             if (
                 float(position["volume"])
-                > record["initial_volume"] + EPSILON
+                > float(record["initial_volume"]) + EPSILON
             ):
                 mark_halt(
-                    state,
-                    path,
+                    state, path,
                     "Tracked position volume increased unexpectedly.",
+                )
+
+            info = broker.info(position["symbol"])
+            tolerance = float(
+                info.get("trade_tick_size") or info["point"]
+            ) / 2.0
+
+            actual_sl = float(position["sl"])
+            last_sl = float(
+                record.get("last_sl", record["initial_sl"])
+            )
+
+            if actual_sl <= 0:
+                mark_halt(
+                    state, path,
+                    "A tracked position has no server-side stop loss.",
+                )
+            else:
+                worsened = (
+                    actual_sl < last_sl - tolerance
+                    if buy
+                    else actual_sl > last_sl + tolerance
+                )
+
+                if worsened:
+                    mark_halt(
+                        state, path,
+                        "A tracked stop moved in a risk-increasing direction.",
+                    )
+                elif abs(actual_sl - last_sl) > tolerance:
+                    record["last_sl"] = actual_sl
+                    updated = True
+
+            if float(position["tp"]) <= 0:
+                mark_halt(
+                    state, path,
+                    "A tracked position has no server-side take profit.",
                 )
 
             continue
@@ -1802,8 +2239,7 @@ def reconcile_positions(broker, state, path):
             for deal in trading
         ):
             mark_halt(
-                state,
-                path,
+                state, path,
                 "A position reversal requires manual reconciliation.",
             )
             continue
@@ -1852,6 +2288,9 @@ def reconcile_positions(broker, state, path):
             last_exit,
         ))
 
+    if updated:
+        atomic_save(path, state)
+
     for closed_time, _, pid, record, pnl, last_exit in sorted(closed):
         if pnl < -EPSILON:
             state["consecutive_losses"] += 1
@@ -1861,7 +2300,6 @@ def reconcile_positions(broker, state, path):
                     float(state["cooldown_until"]),
                     closed_time + COOLDOWN_SECONDS,
                 )
-
                 state["consecutive_losses"] = 0
 
         elif pnl > EPSILON:
@@ -1871,8 +2309,7 @@ def reconcile_positions(broker, state, path):
         atomic_save(path, state)
 
         reason = close_reason(
-            broker,
-            last_exit.get("reason", -1),
+            broker, last_exit.get("reason", -1)
         )
 
         notify(
@@ -1912,6 +2349,7 @@ def daily_snapshot(broker, state, path):
             float(account["balance"]) - total_cash
         )
         state["daily_loss_latched"] = False
+        state["dry_run_entries"] = 0
 
         cutoff = time.time() - 14 * 86400
         state["seen_zones"] = {
@@ -1952,8 +2390,7 @@ def daily_snapshot(broker, state, path):
         for deal in deals
         if trade_deal(broker, deal)
         and int(deal.get("magic", 0)) == MAGIC
-        and int(deal.get("entry", -1))
-        in {
+        and int(deal.get("entry", -1)) in {
             broker.constant("DEAL_ENTRY_IN"),
             broker.constant("DEAL_ENTRY_INOUT"),
         }
@@ -1963,9 +2400,14 @@ def daily_snapshot(broker, state, path):
         if float(record["opened_at"]) >= start:
             entry_ids.add(pid)
 
+    daily_entries = len(entry_ids)
+
+    if DRY_RUN:
+        daily_entries += int(state.get("dry_run_entries", 0))
+
     return {
         "account": account,
-        "daily_entries": len(entry_ids),
+        "daily_entries": daily_entries,
         "daily_pnl": daily_pnl,
         "external_cash_flow": external_cash_flow,
     }
@@ -1973,6 +2415,9 @@ def daily_snapshot(broker, state, path):
 
 def in_session():
     hour = utc_now().hour
+
+    if SESSION_START_HOUR_UTC == SESSION_END_HOUR_UTC:
+        return True
 
     if SESSION_START_HOUR_UTC < SESSION_END_HOUR_UTC:
         return SESSION_START_HOUR_UTC <= hour < SESSION_END_HOUR_UTC
@@ -1994,7 +2439,7 @@ def entry_permission(broker, state, snapshot, positions, orders):
         return False, "The daily loss guard is active."
 
     if snapshot["external_cash_flow"]:
-        return False, "Account cash-flow activity prevents safe daily accounting."
+        return False, "Account cash flow prevents safe daily accounting."
 
     if time.time() < float(state["cooldown_until"]):
         return False, "The consecutive-loss cooldown is active."
@@ -2017,23 +2462,24 @@ def entry_permission(broker, state, snapshot, positions, orders):
         return False, "The entry session is closed."
 
     account = snapshot["account"]
-
-    if not account.get("trade_allowed", False):
-        return False, "Account trading permission is unavailable."
-
-    if not account.get("trade_expert", False):
-        return False, "Automated trading permission is unavailable."
-
     terminal = broker.terminal()
 
     if not terminal.get("connected", False):
         return False, "The terminal is disconnected."
 
-    if not terminal.get("trade_allowed", False):
-        return False, "Terminal trading permission is unavailable."
+    # Dry-run does not require permission to place real orders.
+    if not DRY_RUN:
+        if not account.get("trade_allowed", False):
+            return False, "Account trading permission is unavailable."
 
-    if terminal.get("tradeapi_disabled", False):
-        return False, "External trading API access is disabled."
+        if not account.get("trade_expert", False):
+            return False, "Automated trading permission is unavailable."
+
+        if not terminal.get("trade_allowed", False):
+            return False, "Terminal trading permission is unavailable."
+
+        if terminal.get("tradeapi_disabled", False):
+            return False, "External trading API access is disabled."
 
     return True, "Entry checks passed."
 
@@ -2065,11 +2511,9 @@ def partial_request(broker, position, volume):
 
 
 def stop_request(broker, position_id, desired_sl):
-    positions = broker.positions()
-
     position = next(
         (
-            item for item in positions
+            item for item in broker.positions()
             if position_identifier(item) == position_id
         ),
         None,
@@ -2093,32 +2537,25 @@ def stop_request(broker, position_id, desired_sl):
     )
 
     desired_sl = price_round(
-        desired_sl,
-        info,
-        upward=not buy,
+        desired_sl, info, upward=not buy
     )
 
-    if desired_sl <= 0:
+    if desired_sl <= 0 or current_sl <= 0:
         return None
 
     if buy:
-        if current_sl > 0 and desired_sl <= current_sl + increment / 2:
+        if desired_sl <= current_sl + increment / 2:
             return None
-
         if desired_sl > float(tick["bid"]) - gap:
             return None
-
-        if current_sl > 0 and float(tick["bid"]) - current_sl < gap:
+        if float(tick["bid"]) - current_sl < gap:
             return None
-
     else:
-        if current_sl > 0 and desired_sl >= current_sl - increment / 2:
+        if desired_sl >= current_sl - increment / 2:
             return None
-
         if desired_sl < float(tick["ask"]) + gap:
             return None
-
-        if current_sl > 0 and current_sl - float(tick["ask"]) < gap:
+        if current_sl - float(tick["ask"]) < gap:
             return None
 
     return {
@@ -2132,7 +2569,11 @@ def stop_request(broker, position_id, desired_sl):
 
 
 def manage_positions(broker, state, path):
-    if DRY_RUN or state["pending"] is not None or state["halt_reason"]:
+    if (
+        DRY_RUN
+        or state["pending"] is not None
+        or state["halt_reason"]
+    ):
         return
 
     for position in broker.positions():
@@ -2153,13 +2594,40 @@ def manage_positions(broker, state, path):
 
         if initial_risk <= 0:
             mark_halt(
-                state,
-                path,
+                state, path,
                 "A tracked position has invalid initial risk.",
             )
             return
 
         price = float(tick["bid"] if buy else tick["ask"])
+        current_r = (
+            (price - entry) / initial_risk
+            if buy
+            else (entry - price) / initial_risk
+        )
+
+        age_seconds = time.time() - float(record["opened_at"])
+
+        if (
+            ENABLE_TIME_EXIT
+            and age_seconds >= TIME_EXIT_MINUTES * 60
+            and current_r < TIME_EXIT_MIN_R
+        ):
+            request = partial_request(broker, position, volume)
+
+            execute_request(
+                broker,
+                state,
+                path,
+                "FULL_CLOSE",
+                request,
+                {
+                    "position_id": pid,
+                    "reason": "TIME_EXIT",
+                    "current_r": current_r,
+                },
+            )
+            return
 
         target1 = (
             entry + TP1_RR * initial_risk
@@ -2175,7 +2643,6 @@ def manage_positions(broker, state, path):
         ):
             record["partial_done"] = True
             atomic_save(path, state)
-
             notify(
                 f"Existing volume reduction detected. Symbol: {symbol}\n"
                 "The bot will not repeat the partial close."
@@ -2193,9 +2660,7 @@ def manage_positions(broker, state, path):
                 and remaining + EPSILON >= minimum
             ):
                 request = partial_request(
-                    broker,
-                    position,
-                    closing,
+                    broker, position, closing
                 )
 
                 execute_request(
@@ -2210,7 +2675,6 @@ def manage_positions(broker, state, path):
 
             record["partial_done"] = True
             atomic_save(path, state)
-
             notify(
                 f"Partial close skipped. Symbol: {symbol}\n"
                 "Broker volume limits prevent a valid split. "
@@ -2221,25 +2685,32 @@ def manage_positions(broker, state, path):
             continue
 
         bars = broker.bars(
-            symbol,
-            broker.constant("TIMEFRAME_M5"),
-            100,
+            symbol, broker.constant("TIMEFRAME_M5"), 100
         )
+
+        closed_time = bars[-1]["time"] + 300
+        bar_age = time.time() - closed_time
+
+        if (
+            bar_age < 0
+            or bar_age > MAX_CLOSED_M5_AGE_SECONDS
+        ):
+            continue
 
         volatility = atr(bars)[-1]
 
         if volatility <= 0:
             continue
 
+        # Entry-price protection does not guarantee net break-even
+        # after fees, swap, gaps or slippage.
         if buy:
             desired_sl = max(
-                entry,
-                price - TRAIL_ATR * volatility,
+                entry, price - TRAIL_ATR * volatility
             )
         else:
             desired_sl = min(
-                entry,
-                price + TRAIL_ATR * volatility,
+                entry, price + TRAIL_ATR * volatility
             )
 
         request = stop_request(broker, pid, desired_sl)
@@ -2263,15 +2734,16 @@ def account_key_from(account):
         f"{account.get('server', '')}:"
         f"{int(account['login'])}"
     )
-
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+    return hashlib.sha256(
+        raw.encode("utf-8")
+    ).hexdigest()[:16]
 
 
 def validate_account(broker, expected_key):
     account = broker.account()
 
     if account_key_from(account) != expected_key:
-        raise FatalError("The connected account changed. Trading has stopped.")
+        raise FatalError("The connected account changed.")
 
     if (
         int(account["margin_mode"])
@@ -2279,12 +2751,15 @@ def validate_account(broker, expected_key):
     ):
         raise FatalError("This build supports hedging accounts only.")
 
+    for field in ("balance", "equity", "margin_free"):
+        if not math.isfinite(float(account[field])):
+            raise SafetyError("Account financial data is invalid.")
+
     return account
 
 
 def main():
     validate_config()
-
     broker = None
 
     try:
@@ -2297,6 +2772,8 @@ def main():
         broker.select_symbols()
 
         mode = "dry" if DRY_RUN else "live"
+
+        # Keep the original filename for existing live-state continuity.
         state_path = ROOT / (
             f"bot_state_v2_{account_key}_{MAGIC}_{mode}.json"
         )
@@ -2308,13 +2785,23 @@ def main():
             "SMC bot started.\n"
             f"Mode: {'DRY_RUN' if DRY_RUN else 'LIVE'}\n"
             "Account type: Hedging\n"
-            "Time basis: UTC"
+            "Time basis: UTC\n"
+            f"OB/FVG confluence: {REQUIRE_OB_FVG_CONFLUENCE}\n"
+            f"M15 confirmation: {REQUIRE_M15_CONFIRMATION}\n"
+            f"News filter: {ENABLE_NEWS_FILTER}\n"
+            f"Time exit: {ENABLE_TIME_EXIT}"
         )
 
         if COMMISSION_PER_LOT == 0:
             log(
                 "Commission reserve is zero. "
                 "Configure actual broker costs before live use."
+            )
+
+        if not ENABLE_NEWS_FILTER:
+            log(
+                "News protection is disabled. "
+                "No automatic news feed is included."
             )
 
         while True:
@@ -2332,33 +2819,29 @@ def main():
                     status(
                         "persistent_halt",
                         "A persistent safety halt is active. "
-                        "Server-side stops remain in place.",
+                        "No automatic trading requests will be sent.",
                     )
                     time.sleep(POLL_SECONDS)
                     continue
 
                 manage_positions(broker, state, state_path)
 
-                if state["pending"] is not None:
+                if (
+                    state["pending"] is not None
+                    or state["halt_reason"]
+                ):
                     time.sleep(POLL_SECONDS)
                     continue
 
                 for symbol in SYMBOLS:
                     snapshot = daily_snapshot(
-                        broker,
-                        state,
-                        state_path,
+                        broker, state, state_path
                     )
-
                     positions = broker.positions()
                     orders = broker.orders()
 
                     permitted, reason = entry_permission(
-                        broker,
-                        state,
-                        snapshot,
-                        positions,
-                        orders,
+                        broker, state, snapshot, positions, orders
                     )
 
                     if not permitted:
@@ -2371,32 +2854,28 @@ def main():
                     ):
                         continue
 
+                    news_ok, news_reason = news_permission(
+                        broker, symbol
+                    )
+
+                    if not news_ok:
+                        status(
+                            f"news_{symbol}",
+                            f"{symbol}: {news_reason}",
+                            60,
+                        )
+                        continue
+
                     candidate = scan_symbol(
-                        broker,
-                        symbol,
-                        state,
+                        broker, symbol, state
                     )
 
                     if candidate is None:
                         continue
 
-                    built = build_order(
-                        broker,
-                        candidate,
-                        snapshot["account"],
-                    )
-
-                    if built is None:
-                        continue
-
-                    request, estimated_loss = built
-
                     fresh_snapshot = daily_snapshot(
-                        broker,
-                        state,
-                        state_path,
+                        broker, state, state_path
                     )
-
                     fresh_positions = broker.positions()
                     fresh_orders = broker.orders()
 
@@ -2417,7 +2896,48 @@ def main():
                     ):
                         continue
 
-                    state["seen_zones"][candidate["zone_id"]] = time.time()
+                    # Build using the refreshed account and market tick.
+                    built = build_order(
+                        broker,
+                        candidate,
+                        fresh_snapshot["account"],
+                    )
+
+                    if built is None:
+                        continue
+
+                    request, estimated_loss = built
+
+                    # Final exposure check immediately before journaling.
+                    final_positions = broker.positions()
+                    final_orders = broker.orders()
+
+                    permitted, reason = entry_permission(
+                        broker,
+                        state,
+                        fresh_snapshot,
+                        final_positions,
+                        final_orders,
+                    )
+
+                    if not permitted:
+                        break
+
+                    if any(
+                        item["symbol"] == symbol
+                        for item in final_positions + final_orders
+                    ):
+                        continue
+
+                    state["seen_zones"][
+                        candidate["zone_id"]
+                    ] = time.time()
+
+                    if DRY_RUN:
+                        state["dry_run_entries"] = (
+                            int(state.get("dry_run_entries", 0)) + 1
+                        )
+
                     atomic_save(state_path, state)
 
                     if DRY_RUN:
@@ -2425,6 +2945,8 @@ def main():
                             f"Dry-run signal. Symbol: {symbol}\n"
                             f"Side: {candidate['side']}\n"
                             f"Zone: {candidate['zone']['kind']}\n"
+                            f"Confluence: "
+                            f"{candidate['zone']['confluence']}\n"
                             f"Entry estimate: {request['price']:.8f}\n"
                             f"Stop: {request['sl']:.8f}\n"
                             f"Target: {request['tp']:.8f}\n"
@@ -2445,6 +2967,7 @@ def main():
                             "side": candidate["side"],
                             "zone_id": candidate["zone_id"],
                             "estimated_loss": estimated_loss,
+                            "signal_time": candidate["signal_time"],
                         },
                     )
 
@@ -2463,7 +2986,7 @@ def main():
                     "safety_cycle_error",
                     "A safety or data check failed. "
                     "This cycle will not submit further requests.",
-                    interval=60,
+                    60,
                 )
                 time.sleep(POLL_SECONDS)
 
@@ -2471,8 +2994,8 @@ def main():
                 status(
                     "unexpected_cycle_error",
                     "An unexpected runtime error occurred. "
-                    "This cycle was stopped without exposing external details.",
-                    interval=60,
+                    "This cycle stopped without exposing external details.",
+                    60,
                 )
                 time.sleep(POLL_SECONDS)
 
