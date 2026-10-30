@@ -556,7 +556,7 @@ class Broker:
         return int(getattr(self.mt5, name))
 
     def read(self, expression):
-          """
+        """
         Serialize on the remote side to avoid retaining remote object proxies.
         """
         serialized = self.mt5._container.eval(
