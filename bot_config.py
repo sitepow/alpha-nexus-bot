@@ -42,7 +42,10 @@ EPSILON = 1e-8
 
 SYMBOLS = [
     item.strip()
-    for item in os.getenv("SYMBOLS", "EURUSDm,GBPUSDm,USDJPYm,XAUUSDm").split(",")
+    for item in os.getenv(
+        "SYMBOLS",
+        "EURUSDm,GBPUSDm,USDJPYm,AUDUSDm,USDCADm,NZDUSDm,XAUUSDm,XAGUSDm,USOILm,UKOILm,US30m,USTECm,DE30m,BTCUSDm,ETHUSDm,SOLUSDm"
+    ).split(",")
     if item.strip()
 ]
 
