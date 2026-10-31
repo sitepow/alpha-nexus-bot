@@ -143,6 +143,16 @@ def status(key, message, interval=300):
         LAST_STATUS[key] = now
         log(message)
 
+def volume_ma(bars, period=20):
+    volumes = [bar["volume"] for bar in bars]
+    if not volumes:
+        return []
+    result = []
+    for i in range(len(volumes)):
+        start = max(0, i - period + 1)
+        chunk = volumes[start:i+1]
+        result.append(sum(chunk) / len(chunk))
+    return result
 
 def validate_config():
     if not CFG.SYMBOLS or len(CFG.SYMBOLS) != len(set(CFG.SYMBOLS)):
@@ -488,7 +498,8 @@ class Broker:
             "'open': float(row['open']), "
             "'high': float(row['high']), "
             "'low': float(row['low']), "
-            "'close': float(row['close'])} "
+            "'close': float(row['close']), "
+            "'volume': float(row['tick_volume'])} "
             "for row in values])"
             "(mt5.copy_rates_from_pos("
             f"{symbol!r}, {int(timeframe)}, 1, {int(count)}))"
@@ -736,6 +747,7 @@ def create_zones(bars, side):
     volatility = atr(bars)
     buy = side == "BUY"
     result = []
+    vol_ma = volume_ma(bars, CFG.VOLUME_MA_PERIOD)
 
     first = max(
         CFG.DEALING_RANGE_BARS + 1,
@@ -755,6 +767,11 @@ def create_zones(bars, side):
 
         if reference_atr <= 0:
             continue
+
+        if CFG.USE_VOLUME_FILTER:
+            reference_vol_ma = vol_ma[impulse_index] if impulse_index < len(vol_ma) else 0
+            if reference_vol_ma <= 0 or impulse["volume"] < reference_vol_ma * CFG.DISPLACEMENT_VOLUME_MULTIPLIER:
+                continue
 
         body = abs(impulse["close"] - impulse["open"])
         candle_range = impulse["high"] - impulse["low"]
@@ -915,6 +932,7 @@ def zone_signal(zone, bars, volatility):
         return None
 
     buy = zone["side"] == "BUY"
+    vol_ma = volume_ma(bars, CFG.VOLUME_MA_PERIOD)
 
     eligible = [
         index
@@ -989,7 +1007,7 @@ def zone_signal(zone, bars, volatility):
         else:
             counter_structure = (
                 highs[-1]["price"] > highs[-2]["price"]
-                and lows[-1]["price"] > lows[-2]["price"]
+                and lows[-1]["price"] < lows[-2]["price"]
             )
             liquidity = highs[-1]
             confirmation = lows[-1]
@@ -1072,12 +1090,15 @@ def zone_signal(zone, bars, volatility):
             close_buffer = CFG.CONFIRM_CLOSE_BUFFER_ATR * reference
             body = abs(bar["close"] - bar["open"])
 
+            if CFG.USE_VOLUME_FILTER:
+                conf_vol_ma = vol_ma[confirmation_index] if confirmation_index < len(vol_ma) else 0
+                if conf_vol_ma > 0 and bar["volume"] < conf_vol_ma * CFG.SWEEP_CONFIRM_VOLUME_MULTIPLIER:
+                    break
+
             strong_close = (
-                bar["close"] > level + close_buffer
-                and bar["close"] > bar["open"]
+                (bar["close"] > level + close_buffer and bar["close"] > bar["open"])
                 if buy
-                else bar["close"] < level - close_buffer
-                and bar["close"] < bar["open"]
+                else (bar["close"] < level - close_buffer and bar["close"] < bar["open"])
             )
 
             if (

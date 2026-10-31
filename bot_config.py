@@ -161,3 +161,12 @@ NEWS_MEDIUM_IMPACT_BUFFER_MIN = 15
 NEWS_SOURCES = [
     "https://nfs.faireconomy.media/ff_calendar_thisweek.json",
 ]
+
+# ==========================================
+# 8. VOLUME SETTINGS
+# ==========================================
+
+USE_VOLUME_FILTER = env_bool("USE_VOLUME_FILTER", True)
+VOLUME_MA_PERIOD = env_int("VOLUME_MA_PERIOD", 20)
+DISPLACEMENT_VOLUME_MULTIPLIER = env_float("DISPLACEMENT_VOLUME_MULTIPLIER", 1.5)
+SWEEP_CONFIRM_VOLUME_MULTIPLIER = env_float("SWEEP_CONFIRM_VOLUME_MULTIPLIER", 1.2)
