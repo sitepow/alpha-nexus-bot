@@ -54,7 +54,7 @@ import requests
 
 from dotenv import load_dotenv
 from mt5linux import MetaTrader5
-from news_fetcher import NewsFetcher
+from bot_news import NewsFetcher
 import bot_config as CFG
 
 try:
