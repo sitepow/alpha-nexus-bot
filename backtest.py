@@ -241,7 +241,7 @@ class HistoricalData:
 
             print(f"Historical bars ready: {symbol}", flush=True)
 
-    def _load_bars_with_retry(
+        def _load_bars_with_retry(
         self,
         symbol,
         name,
@@ -252,17 +252,19 @@ class HistoricalData:
         attempts=8,
         delay_seconds=1.0,
     ):
-        """
-        Force MT5 to download history, then retry until we have enough bars.
-
-        Uses copy_rates_range first (which triggers terminal download) and
-        falls back to copy_rates_from_pos to verify the cached depth.
-        Returns a sorted, de-duplicated list of bar dicts.
-        """
+        """Load bars via copy_rates_from_pos and filter to [warmup, end]."""
         import time as _time
 
         rows = []
         last_reported = 0
+        tf_seconds = TF_SECONDS[name]
+
+        # Estimate bars needed to cover warmup..end from "now" backward.
+        span_seconds = max(0, end - warmup)
+        needed = max(
+            required + 500,
+            int(span_seconds / tf_seconds * 2) + required,
+        )
 
         for attempt in range(1, attempts + 1):
             expression = (
@@ -273,14 +275,22 @@ class HistoricalData:
                 "'low': float(r['low']), "
                 "'close': float(r['close'])} "
                 "for r in rows])"
-                "(mt5.copy_rates_range("
-                f"{symbol!r}, {timeframe}, "
-                f"{dt_expr(warmup)}, {dt_expr(end)}))"
+                f"(mt5.copy_rates_from_pos({symbol!r}, "
+                f"{timeframe}, 0, {needed}))"
             )
 
-            fresh = self.broker.read(expression) or []
+            try:
+                fresh = self.broker.read(expression) or []
+            except Exception as exc:
+                print(f"  from_pos failed {symbol}/{name}: {exc}",
+                      flush=True)
+                fresh = []
 
-            # Merge + de-duplicate by timestamp.
+            fresh = [
+                r for r in fresh
+                if warmup <= r["time"] <= end
+            ]
+
             merged = {row["time"]: row for row in rows}
             for row in fresh:
                 merged[row["time"]] = row
@@ -288,33 +298,27 @@ class HistoricalData:
             rows.sort(key=lambda row: row["time"])
 
             if len(rows) >= required:
+                print(
+                    f"  loaded {symbol}/{name}: {len(rows)} bars",
+                    flush=True,
+                )
                 return rows
-
-            # Ask the terminal to warm up its cache with a positional read.
-            # This is the documented way to trigger history download.
-            if attempt == 1 or attempt % 3 == 0:
-                try:
-                    self.broker.read(
-                        f"mt5.copy_rates_from_pos({symbol!r}, "
-                        f"{timeframe}, 0, {max(required + 500, 2000)})"
-                    )
-                except Exception:
-                    pass
 
             if len(rows) != last_reported:
                 print(
-                    f"  warming up {symbol}/{name}: "
+                    f"  loading {symbol}/{name}: "
                     f"{len(rows)}/{required} bars "
-                    f"(attempt {attempt}/{attempts})",
+                    f"(attempt {attempt}/{attempts}, "
+                    f"requested {needed})",
                     flush=True,
                 )
                 last_reported = len(rows)
 
             if attempt < attempts:
+                needed = int(needed * 1.5)
                 _time.sleep(delay_seconds)
 
         return rows
-
 
     def window(self, symbol, name, decision_seconds, count):
         times = self.close_times[symbol][name]
