@@ -260,10 +260,14 @@ class HistoricalData:
         tf_seconds = TF_SECONDS[name]
 
         span_seconds = max(0, end - warmup)
-        needed = max(
+        # MT5 caps copy_rates_from_pos around 100k bars; requesting more
+        # returns None. Cap and also clamp against required.
+        MAX_POS_BARS = 100_000
+        wanted = max(
             required + 500,
             int(span_seconds / tf_seconds * 2) + required,
         )
+        needed = min(wanted, MAX_POS_BARS)
 
         for attempt in range(1, attempts + 1):
             expression = (
