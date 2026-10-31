@@ -260,14 +260,18 @@ class HistoricalData:
         tf_seconds = TF_SECONDS[name]
 
         span_seconds = max(0, end - warmup)
-        # MT5 caps copy_rates_from_pos around 100k bars; requesting more
-        # returns None. Cap and also clamp against required.
-        MAX_POS_BARS = 100_000
+        # MT5 caps copy_rates_from_pos conservatively.
+        MAX_POS_BARS = 50_000
         wanted = max(
             required + 500,
             int(span_seconds / tf_seconds * 2) + required,
         )
         needed = min(wanted, MAX_POS_BARS)
+        print(
+            f"  [{symbol}/{name}] needed={needed} "
+            f"(wanted={wanted}, required={required})",
+            flush=True,
+        )
 
         for attempt in range(1, attempts + 1):
             expression = (
@@ -284,6 +288,11 @@ class HistoricalData:
 
             try:
                 fresh = self.broker.read(expression) or []
+                print(
+                    f"  [{symbol}/{name}] from_pos returned "
+                    f"{len(fresh)} bars",
+                    flush=True,
+                )
             except Exception as exc:
                 print(f"  from_pos failed {symbol}/{name}: {exc}",
                       flush=True)
