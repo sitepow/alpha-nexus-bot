@@ -131,8 +131,8 @@ class HistoricalData:
 
         # Allow enough calendar time for EMA warm-up and market closures.
         warmup_days = max(
-            180,
-            math.ceil(bot.H4_BAR_COUNT * 4 / 24 * 2),
+            260,
+            math.ceil(bot.H4_BAR_COUNT * 4 / 24 * 2.5),
         )
         warmup = start - warmup_days * 86400
 
@@ -187,27 +187,25 @@ class HistoricalData:
             self.close_times[symbol] = {}
 
             for name, timeframe in constants.items():
-                expression = (
-                    "(lambda rows: None if rows is None else ["
-                    "{'time': int(r['time']), "
-                    "'open': float(r['open']), "
-                    "'high': float(r['high']), "
-                    "'low': float(r['low']), "
-                    "'close': float(r['close'])} "
-                    "for r in rows])"
-                    "(mt5.copy_rates_range("
-                    f"{symbol!r}, {timeframe}, "
-                    f"{dt_expr(warmup)}, {dt_expr(end)}))"
-                )
+                required = {
+                    "H4": bot.H4_BAR_COUNT,
+                    "M15": bot.M15_BAR_COUNT,
+                    "M5": bot.M5_BAR_COUNT,
+                }[name]
 
-                rows = self.broker.read(expression)
+                rows = self._load_bars_with_retry(
+                    symbol,
+                    name,
+                    timeframe,
+                    warmup,
+                    end,
+                    required,
+                )
 
                 if not rows:
                     raise RuntimeError(
                         f"No historical {name} bars: {symbol}"
                     )
-
-                rows.sort(key=lambda row: row["time"])
 
                 times = [row["time"] for row in rows]
                 if len(times) != len(set(times)):
@@ -242,6 +240,81 @@ class HistoricalData:
                 )
 
             print(f"Historical bars ready: {symbol}", flush=True)
+
+    def _load_bars_with_retry(
+        self,
+        symbol,
+        name,
+        timeframe,
+        warmup,
+        end,
+        required,
+        attempts=8,
+        delay_seconds=1.0,
+    ):
+        """
+        Force MT5 to download history, then retry until we have enough bars.
+
+        Uses copy_rates_range first (which triggers terminal download) and
+        falls back to copy_rates_from_pos to verify the cached depth.
+        Returns a sorted, de-duplicated list of bar dicts.
+        """
+        import time as _time
+
+        rows = []
+        last_reported = 0
+
+        for attempt in range(1, attempts + 1):
+            expression = (
+                "(lambda rows: None if rows is None else ["
+                "{'time': int(r['time']), "
+                "'open': float(r['open']), "
+                "'high': float(r['high']), "
+                "'low': float(r['low']), "
+                "'close': float(r['close'])} "
+                "for r in rows])"
+                "(mt5.copy_rates_range("
+                f"{symbol!r}, {timeframe}, "
+                f"{dt_expr(warmup)}, {dt_expr(end)}))"
+            )
+
+            fresh = self.broker.read(expression) or []
+
+            # Merge + de-duplicate by timestamp.
+            merged = {row["time"]: row for row in rows}
+            for row in fresh:
+                merged[row["time"]] = row
+            rows = list(merged.values())
+            rows.sort(key=lambda row: row["time"])
+
+            if len(rows) >= required:
+                return rows
+
+            # Ask the terminal to warm up its cache with a positional read.
+            # This is the documented way to trigger history download.
+            if attempt == 1 or attempt % 3 == 0:
+                try:
+                    self.broker.read(
+                        f"mt5.copy_rates_from_pos({symbol!r}, "
+                        f"{timeframe}, 0, {max(required + 500, 2000)})"
+                    )
+                except Exception:
+                    pass
+
+            if len(rows) != last_reported:
+                print(
+                    f"  warming up {symbol}/{name}: "
+                    f"{len(rows)}/{required} bars "
+                    f"(attempt {attempt}/{attempts})",
+                    flush=True,
+                )
+                last_reported = len(rows)
+
+            if attempt < attempts:
+                _time.sleep(delay_seconds)
+
+        return rows
+
 
     def window(self, symbol, name, decision_seconds, count):
         times = self.close_times[symbol][name]
