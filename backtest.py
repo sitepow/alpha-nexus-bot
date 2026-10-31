@@ -241,7 +241,7 @@ class HistoricalData:
 
             print(f"Historical bars ready: {symbol}", flush=True)
 
-        def _load_bars_with_retry(
+    def _load_bars_with_retry(
         self,
         symbol,
         name,
@@ -252,14 +252,13 @@ class HistoricalData:
         attempts=8,
         delay_seconds=1.0,
     ):
-        """Load bars via copy_rates_from_pos and filter to [warmup, end]."""
+        """Load bars via copy_rates_from_pos, filter to [warmup, end]."""
         import time as _time
 
         rows = []
         last_reported = 0
         tf_seconds = TF_SECONDS[name]
 
-        # Estimate bars needed to cover warmup..end from "now" backward.
         span_seconds = max(0, end - warmup)
         needed = max(
             required + 500,
