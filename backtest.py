@@ -249,30 +249,29 @@ class HistoricalData:
         warmup,
         end,
         required,
-        attempts=8,
+        attempts=3,
         delay_seconds=1.0,
     ):
         """Load bars via copy_rates_from_pos, filter to [warmup, end]."""
         import time as _time
 
-        rows = []
-        last_reported = 0
         tf_seconds = TF_SECONDS[name]
+        MAX_POS_BARS = 100_000
 
         span_seconds = max(0, end - warmup)
-        # MT5 caps copy_rates_from_pos conservatively.
-        MAX_POS_BARS = 50_000
         wanted = max(
             required + 500,
             int(span_seconds / tf_seconds * 2) + required,
         )
         needed = min(wanted, MAX_POS_BARS)
+
         print(
-            f"  [{symbol}/{name}] needed={needed} "
-            f"(wanted={wanted}, required={required})",
+            f"  [{symbol}/{name}] requesting {needed} bars "
+            f"(wanted {wanted}, need {required})",
             flush=True,
         )
 
+        rows = []
         for attempt in range(1, attempts + 1):
             expression = (
                 "(lambda rows: None if rows is None else ["
@@ -288,49 +287,61 @@ class HistoricalData:
 
             try:
                 fresh = self.broker.read(expression) or []
+            except Exception as exc:
                 print(
-                    f"  [{symbol}/{name}] from_pos returned "
-                    f"{len(fresh)} bars",
+                    f"  [{symbol}/{name}] from_pos error: {exc}",
                     flush=True,
                 )
-            except Exception as exc:
-                print(f"  from_pos failed {symbol}/{name}: {exc}",
-                      flush=True)
                 fresh = []
 
-            fresh = [
+            if not fresh:
+                print(
+                    f"  [{symbol}/{name}] from_pos returned 0 bars "
+                    f"(attempt {attempt}/{attempts})",
+                    flush=True,
+                )
+                if attempt < attempts:
+                    _time.sleep(delay_seconds)
+                continue
+
+            # Filter to requested window.
+            filtered = [
                 r for r in fresh
                 if warmup <= r["time"] <= end
             ]
 
-            merged = {row["time"]: row for row in rows}
-            for row in fresh:
-                merged[row["time"]] = row
-            rows = list(merged.values())
-            rows.sort(key=lambda row: row["time"])
+            print(
+                f"  [{symbol}/{name}] got {len(fresh)} bars, "
+                f"{len(filtered)} in window "
+                f"[{iso(int(warmup*1000))} .. {iso(int(end*1000))}]",
+                flush=True,
+            )
 
-            if len(rows) >= required:
+            if len(filtered) >= required:
+                return filtered
+
+            # If we got bars but not enough in window, requesting MORE
+            # won't help — the terminal doesn't have older history.
+            if len(fresh) < needed:
                 print(
-                    f"  loaded {symbol}/{name}: {len(rows)} bars",
+                    f"  [{symbol}/{name}] terminal only has "
+                    f"{len(fresh)} bars total (asked {needed}). "
+                    f"Not enough history.",
                     flush=True,
                 )
-                return rows
+                break
 
-            if len(rows) != last_reported:
-                print(
-                    f"  loading {symbol}/{name}: "
-                    f"{len(rows)}/{required} bars "
-                    f"(attempt {attempt}/{attempts}, "
-                    f"requested {needed})",
-                    flush=True,
-                )
-                last_reported = len(rows)
-
+            # Retry only if we got the full batch but still short —
+            # grows needed within the limit.
             if attempt < attempts:
-                needed = int(needed * 1.5)
+                needed = min(int(needed * 1.3), MAX_POS_BARS)
                 _time.sleep(delay_seconds)
 
-        return rows
+        # If we got here, not enough. Give back whatever we have.
+        if rows:
+            return rows
+        # Return the filtered set even if short (caller decides).
+        return filtered if 'filtered' in dir() else []
 
     def window(self, symbol, name, decision_seconds, count):
         times = self.close_times[symbol][name]
