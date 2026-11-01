@@ -2501,16 +2501,26 @@ def manage_positions(broker, state, path):
         if volatility <= 0:
             continue
 
-        # Entry-price protection does not guarantee net break-even
-        # after fees, swap, gaps or slippage.
+        # ==========================================
+        # Structural Trailing Stop (M5 Swings)
+        # ==========================================
+        highs, lows = swings(bars, CFG.LTF_SWING_WINDOW)
+        buffer = CFG.SL_BUFFER_ATR * volatility
+        desired_sl = None
+
         if buy:
-            desired_sl = max(
-                entry, price - CFG.TRAIL_ATR * volatility
-            )
+            valid_lows = [l["price"] for l in lows if l["price"] < price]
+            if valid_lows:
+                structural_sl = valid_lows[-1] - buffer
+                desired_sl = max(entry, structural_sl)
         else:
-            desired_sl = min(
-                entry, price + CFG.TRAIL_ATR * volatility
-            )
+            valid_highs = [h["price"] for h in highs if h["price"] > price]
+            if valid_highs:
+                structural_sl = valid_highs[-1] + buffer
+                desired_sl = min(entry, structural_sl)
+
+        if desired_sl is None:
+            continue
 
         request = stop_request(broker, pid, desired_sl)
 
