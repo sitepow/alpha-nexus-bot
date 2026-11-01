@@ -90,6 +90,12 @@ def utc_midnight_timestamp():
         hour=0, minute=0, second=0, microsecond=0
     ).timestamp()
 
+def is_volume_building_up(bars, index, lookback=3):
+    if index < lookback:
+        return True
+    subset = bars[index - lookback + 1 : index + 1]
+    vols = [b["volume"] for b in subset]
+    return vols[-1] >= sum(vols) / len(vols)
 
 def safe_text(text):
     """
@@ -773,6 +779,9 @@ def create_zones(bars, side):
             if reference_vol_ma <= 0 or impulse["volume"] < reference_vol_ma * CFG.DISPLACEMENT_VOLUME_MULTIPLIER:
                 continue
 
+            if CFG.REQUIRE_CUMULATIVE_VOLUME_BUILDUP and not is_volume_building_up(bars, impulse_index, CFG.VOL_BUILDUP_LOOKBACK):
+                continue
+
         body = abs(impulse["close"] - impulse["open"])
         candle_range = impulse["high"] - impulse["low"]
 
@@ -988,6 +997,16 @@ def zone_signal(zone, bars, volatility):
 
         if reference_atr <= 0:
             continue
+
+        bar_range = sweep_bar["high"] - sweep_bar["low"]
+        if bar_range > 0:
+            wick_ratio = (
+                (sweep_bar["high"] - sweep_bar["close"]) / bar_range
+                if buy
+                else (sweep_bar["close"] - sweep_bar["low"]) / bar_range
+            )
+            if wick_ratio > CFG.MAX_SWEEP_WICK_RATIO:
+                continue
 
         overlaps = (
             sweep_bar["low"] <= zone["top"]
@@ -2189,6 +2208,12 @@ def daily_snapshot(broker, state, path):
 
 def in_session():
     hour = utc_now().hour
+
+    if CFG.USE_KILLZONES_ONLY:
+        for start_k, end_k in CFG.KILLZONES_UTC:
+            if start_k <= hour < end_k:
+                return True
+        return False
 
     if CFG.SESSION_START_HOUR_UTC == CFG.SESSION_END_HOUR_UTC:
         return True
