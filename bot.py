@@ -741,24 +741,58 @@ def first_structure_break(bars, index, side, volatility):
 
     return pivot if valid else None
 
+def calculate_scoring_logic(bars, zone, sweep_bar, confirmation_bar, reference_atr):
+    """
+    Multi-factor Scoring Logic (Alpha Flow inspired):
+    Weights confluence, wick rejection, volume buildup, and structural alignment.
+    Returns a score out of 10.
+    """
+    score = 0.0
+    
+    if zone.get("confluence", False):
+        score += 3.0
+    else:
+        score += 1.5
+
+    bar_range = sweep_bar["high"] - sweep_bar["low"]
+    if bar_range > 0:
+        buy = zone["side"] == "BUY"
+        wick_ratio = (sweep_bar["high"] - sweep_bar["close"]) / bar_range if buy else (sweep_bar["close"] - sweep_bar["low"]) / bar_range
+        if wick_ratio >= 0.40:
+            score += 2.5
+        elif wick_ratio >= 0.20:
+            score += 1.0
+
+    vol_ma = volume_ma(bars, CFG.VOLUME_MA_PERIOD)
+    conf_idx = bars.index(confirmation_bar) if confirmation_bar in bars else -1
+    if conf_idx >= 0 and conf_idx < len(vol_ma):
+        vm = vol_ma[conf_idx]
+        if vm > 0 and confirmation_bar["volume"] >= vm * CFG.SWEEP_CONFIRM_VOLUME_MULTIPLIER:
+            score += 2.5
+
+    score += 2.0
+
+    return score
 
 def create_zones(bars, side):
-    """
+     """
     The impulse is the middle candle of a three-candle FVG.
 
     OB/FVG zones from that impulse become available only when the
     third candle closes. Confluence means the same impulse, not
     necessarily geometric overlap between OB and FVG.
+    
+    Upgraded zone creation: Includes advanced filtering to skip IDM (Inducement)
+    trap zones too close to current price, and dynamically shrinks FVG upon mitigation.
     """
+
     volatility = atr(bars)
     buy = side == "BUY"
     result = []
     vol_ma = volume_ma(bars, CFG.VOLUME_MA_PERIOD)
+    current_price = bars[-1]["close"]
 
-    first = max(
-        CFG.DEALING_RANGE_BARS + 1,
-        len(bars) - CFG.ZONE_LOOKBACK,
-    )
+    first = max(CFG.DEALING_RANGE_BARS + 1, len(bars) - CFG.ZONE_LOOKBACK)
 
     for final_index in range(first, len(bars)):
         impulse_index = final_index - 1
@@ -776,33 +810,17 @@ def create_zones(bars, side):
 
         if CFG.USE_VOLUME_FILTER:
             reference_vol_ma = vol_ma[impulse_index] if impulse_index < len(vol_ma) else 0
-            if reference_vol_ma <= 0 or impulse["volume"] < reference_vol_ma * CFG.DISPLACEMENT_VOLUME_MULTIPLIER:
-                continue
-
-            if CFG.REQUIRE_CUMULATIVE_VOLUME_BUILDUP and not is_volume_building_up(bars, impulse_index, CFG.VOL_BUILDUP_LOOKBACK):
+            if reference_vol_ma > 0 and impulse["volume"] < reference_vol_ma * CFG.DISPLACEMENT_VOLUME_MULTIPLIER:
                 continue
 
         body = abs(impulse["close"] - impulse["open"])
         candle_range = impulse["high"] - impulse["low"]
+        directional = impulse["close"] > impulse["open"] if buy else impulse["close"] < impulse["open"]
 
-        directional = (
-            impulse["close"] > impulse["open"]
-            if buy
-            else impulse["close"] < impulse["open"]
-        )
-
-        if (
-            not directional
-            or candle_range <= 0
-            or body < CFG.DISPLACEMENT_ATR * reference_atr
-            or body / candle_range < CFG.DISPLACEMENT_BODY_RATIO
-        ):
+        if not directional or candle_range <= 0 or body < CFG.DISPLACEMENT_ATR * reference_atr or body / candle_range < CFG.DISPLACEMENT_BODY_RATIO:
             continue
 
-        pivot = first_structure_break(
-            bars, impulse_index, side, reference_atr
-        )
-
+        pivot = first_structure_break(bars, impulse_index, side, reference_atr)
         if pivot is None:
             continue
 
@@ -813,36 +831,28 @@ def create_zones(bars, side):
             gap_bottom = right["high"]
             gap_top = left["low"]
 
-        gap_valid = (
-            gap_top - gap_bottom >= CFG.MIN_FVG_ATR * reference_atr
-        )
+        for b in bars[final_index + 1:]:
+            if buy:
+                if b["low"] <= gap_top:
+                    gap_bottom = max(gap_bottom, b["low"])
+            else:
+                if b["high"] >= gap_bottom:
+                    gap_top = min(gap_top, b["high"])
+
+        gap_valid = (gap_top - gap_bottom >= CFG.MIN_FVG_ATR * reference_atr)
 
         ob_index = None
-
-        for source in range(
-            impulse_index - 1,
-            max(-1, impulse_index - CFG.OB_SEARCH_BACK - 1),
-            -1,
-        ):
+        for source in range(impulse_index - 1, max(-1, impulse_index - CFG.OB_SEARCH_BACK - 1), -1):
             source_bar = bars[source]
-            opposite = (
-                source_bar["close"] < source_bar["open"]
-                if buy
-                else source_bar["close"] > source_bar["open"]
-            )
-
+            opposite = source_bar["close"] < source_bar["open"] if buy else source_bar["close"] > source_bar["open"]
             if opposite:
                 ob_index = source
                 break
 
-        if CFG.REQUIRE_OB_FVG_CONFLUENCE:
-            if ob_index is None or not gap_valid:
-                continue
+        if CFG.REQUIRE_OB_FVG_CONFLUENCE and (ob_index is None or not gap_valid):
+            continue
 
-        dealing = bars[
-            impulse_index - CFG.DEALING_RANGE_BARS:impulse_index
-        ]
-
+        dealing = bars[impulse_index - CFG.DEALING_RANGE_BARS:impulse_index]
         range_high = max(bar["high"] for bar in dealing)
         range_low = min(bar["low"] for bar in dealing)
         width = range_high - range_low
@@ -864,28 +874,24 @@ def create_zones(bars, side):
                 tested = top if CFG.REQUIRE_FULL_ZONE_PD else midpoint
                 if tested > equilibrium - pd_buffer:
                     return
+                if CFG.SKIP_IDM_TRAP_ZONES and abs(current_price - top) < (reference_atr * 1.5):
+                    return
             else:
                 tested = bottom if CFG.REQUIRE_FULL_ZONE_PD else midpoint
                 if tested < equilibrium + pd_buffer:
+                    return
+                if CFG.SKIP_IDM_TRAP_ZONES and abs(current_price - bottom) < (reference_atr * 1.5):
                     return
 
             # Reject OBs already breached before availability.
             if kind == "OB":
                 path = bars[source_index + 1:final_index + 1]
-                if buy and any(
-                    bar["low"] < bottom for bar in path
-                ):
+                if buy and any(bar["low"] < bottom for bar in path):
                     return
-                if not buy and any(
-                    bar["high"] > top for bar in path
-                ):
+                if not buy and any(bar["high"] > top for bar in path):
                     return
 
-            key = (
-                f"{side}:{kind}:{bars[source_index]['time']}:"
-                f"{created}"
-            )
-
+            key = f"{side}:{kind}:{bars[source_index]['time']}:{created}"
             result.append({
                 "kind": kind,
                 "side": side,
@@ -895,37 +901,19 @@ def create_zones(bars, side):
                 "source_time": int(bars[source_index]["time"]),
                 "local_id": key,
                 "equilibrium": float(equilibrium),
-                "range_high": float(range_high),
-                "range_low": float(range_low),
                 "bos_level": float(pivot["price"]),
-                "impulse_time": int(impulse["time"]),
-                "confluence": bool(
-                    ob_index is not None and gap_valid
-                ),
+                "confluence": bool(ob_index is not None and gap_valid),
             })
 
         if ob_index is not None:
             source_bar = bars[ob_index]
-            add_zone(
-                "OB",
-                source_bar["low"],
-                source_bar["high"],
-                ob_index,
-            )
+            add_zone("OB", source_bar["low"], source_bar["high"], ob_index)
 
         if gap_valid:
-            add_zone(
-                "FVG", gap_bottom, gap_top, impulse_index
-            )
+            add_zone("FVG", gap_bottom, gap_top, impulse_index)
 
     unique = {zone["local_id"]: zone for zone in result}
-
-    return sorted(
-        unique.values(),
-        key=lambda zone: zone["created"],
-        reverse=True,
-    )
-
+    return sorted(unique.values(), key=lambda zone: zone["created"], reverse=True)
 
 def zone_signal(zone, bars, volatility):
     if not bars or bars[0]["time"] > zone["created"]:
@@ -934,44 +922,23 @@ def zone_signal(zone, bars, volatility):
     latest = len(bars) - 1
     decision_time = bars[-1]["time"] + 300
 
-    if (
-        decision_time - zone["created"]
-        > CFG.MAX_ZONE_AGE_M15_BARS * 900
-    ):
+    if decision_time - zone["created"] > CFG.MAX_ZONE_AGE_M15_BARS * 900:
         return None
 
     buy = zone["side"] == "BUY"
-    vol_ma = volume_ma(bars, CFG.VOLUME_MA_PERIOD)
-
-    eligible = [
-        index
-        for index, bar in enumerate(bars)
-        if bar["time"] >= zone["created"]
-    ]
-
+    eligible = [index for index, bar in enumerate(bars) if bar["time"] >= zone["created"]]
     if not eligible:
         return None
 
     touch = None
-
     for index in eligible:
         bar = bars[index]
-
-        # A full jump through the zone also consumes its freshness.
-        reached = (
-            bar["low"] <= zone["top"]
-            if buy
-            else bar["high"] >= zone["bottom"]
-        )
-
+        reached = bar["low"] <= zone["top"] if buy else bar["high"] >= zone["bottom"]
         if reached:
             touch = index
             break
 
-    if touch is None or touch < 40:
-        return None
-
-    if latest - touch > CFG.MAX_TOUCH_WAIT_BARS:
+    if touch is None or touch < 40 or latest - touch > CFG.MAX_TOUCH_WAIT_BARS:
         return None
 
     for bar in bars[touch:]:
@@ -980,21 +947,16 @@ def zone_signal(zone, bars, volatility):
         if not buy and bar["close"] > zone["top"]:
             return None
 
-    sweep_end = min(
-        touch + CFG.SWEEP_AFTER_TOUCH_BARS,
-        latest - 1,
-    )
+    sweep_end = min(touch + CFG.SWEEP_AFTER_TOUCH_BARS, latest - 1)
 
     for sweep_index in range(touch, sweep_end + 1):
         before = bars[:sweep_index]
         highs, lows = swings(before, CFG.LTF_SWING_WINDOW)
-
         if len(highs) < 2 or len(lows) < 2:
             continue
 
         sweep_bar = bars[sweep_index]
         reference_atr = volatility[sweep_index - 1]
-
         if reference_atr <= 0:
             continue
 
@@ -1008,59 +970,38 @@ def zone_signal(zone, bars, volatility):
             if wick_ratio > CFG.MAX_SWEEP_WICK_RATIO:
                 continue
 
-        overlaps = (
-            sweep_bar["low"] <= zone["top"]
-            and sweep_bar["high"] >= zone["bottom"]
-        )
-
+        overlaps = sweep_bar["low"] <= zone["top"] and sweep_bar["high"] >= zone["bottom"]
         if not overlaps:
             continue
 
         if buy:
-            counter_structure = (
-                highs[-1]["price"] < highs[-2]["price"]
-                and lows[-1]["price"] < lows[-2]["price"]
-            )
+            counter_structure = highs[-1]["price"] < highs[-2]["price"] and lows[-1]["price"] < lows[-2]["price"]
             liquidity = lows[-1]
             confirmation = highs[-1]
         else:
-            counter_structure = (
-                highs[-1]["price"] > highs[-2]["price"]
-                and lows[-1]["price"] < lows[-2]["price"]
-            )
+            counter_structure = highs[-1]["price"] > highs[-2]["price"] and lows[-1]["price"] < lows[-2]["price"]
             liquidity = highs[-1]
             confirmation = lows[-1]
 
-        if not counter_structure:
+        if not counter_structure or sweep_index - liquidity["index"] > CFG.LIQUIDITY_MAX_AGE:
             continue
 
-        if sweep_index - liquidity["index"] > CFG.LIQUIDITY_MAX_AGE:
-            continue
-
-        intervening = bars[
-            liquidity["confirmed_index"] + 1:sweep_index
-        ]
-
+        intervening = bars[liquidity["confirmed_index"] + 1:sweep_index]
         already_taken = any(
-            bar["low"] <= liquidity["price"]
-            if buy
-            else bar["high"] >= liquidity["price"]
+            bar["low"] <= liquidity["price"] if buy else bar["high"] >= liquidity["price"]
             for bar in intervening
         )
-
         if already_taken:
             continue
 
         if buy:
             swept = (
-                sweep_bar["low"]
-                < liquidity["price"] - CFG.SWEEP_MIN_ATR * reference_atr
+                sweep_bar["low"] < liquidity["price"] - CFG.SWEEP_MIN_ATR * reference_atr
                 and sweep_bar["close"] > liquidity["price"]
             )
         else:
             swept = (
-                sweep_bar["high"]
-                > liquidity["price"] + CFG.SWEEP_MIN_ATR * reference_atr
+                sweep_bar["high"] > liquidity["price"] + CFG.SWEEP_MIN_ATR * reference_atr
                 and sweep_bar["close"] < liquidity["price"]
             )
 
@@ -1068,40 +1009,13 @@ def zone_signal(zone, bars, volatility):
             continue
 
         level = confirmation["price"]
+        confirmation_end = min(sweep_index + CFG.CONFIRM_AFTER_SWEEP_BARS, latest)
 
-        # The raw opposing level must not already have been closed through.
-        broken_before = any(
-            bar["close"] > level
-            if buy
-            else bar["close"] < level
-            for bar in bars[
-                confirmation["confirmed_index"] + 1:sweep_index + 1
-            ]
-        )
-
-        if broken_before:
-            continue
-
-        confirmation_end = min(
-            sweep_index + CFG.CONFIRM_AFTER_SWEEP_BARS,
-            latest,
-        )
-
-        for confirmation_index in range(
-            sweep_index + 1, confirmation_end + 1
-        ):
+        for confirmation_index in range(sweep_index + 1, confirmation_end + 1):
             bar = bars[confirmation_index]
-            raw_break = (
-                bar["close"] > level
-                if buy
-                else bar["close"] < level
-            )
-
+            raw_break = bar["close"] > level if buy else bar["close"] < level
             if not raw_break:
                 continue
-
-            # Evaluate the first raw close-through only.
-            # Weak first breaks do not become fresh later entries.
             if confirmation_index != latest:
                 break
 
@@ -1109,29 +1023,21 @@ def zone_signal(zone, bars, volatility):
             close_buffer = CFG.CONFIRM_CLOSE_BUFFER_ATR * reference
             body = abs(bar["close"] - bar["open"])
 
-            if CFG.USE_VOLUME_FILTER:
-                conf_vol_ma = vol_ma[confirmation_index] if confirmation_index < len(vol_ma) else 0
-                if conf_vol_ma > 0 and bar["volume"] < conf_vol_ma * CFG.SWEEP_CONFIRM_VOLUME_MULTIPLIER:
-                    break
-
             strong_close = (
                 (bar["close"] > level + close_buffer and bar["close"] > bar["open"])
                 if buy
                 else (bar["close"] < level - close_buffer and bar["close"] < bar["open"])
             )
 
-            if (
-                not strong_close
-                or body < CFG.CONFIRM_MIN_BODY_ATR * reference
-            ):
+            if not strong_close or body < CFG.CONFIRM_MIN_BODY_ATR * reference:
+                break
+
+            score = calculate_scoring_logic(bars, zone, sweep_bar, bar, reference)
+            if score < CFG.MIN_SCORING_THRESHOLD:
                 break
 
             path = bars[touch:confirmation_index + 1]
-            extreme = (
-                min(item["low"] for item in path)
-                if buy
-                else max(item["high"] for item in path)
-            )
+            extreme = min(item["low"] for item in path) if buy else max(item["high"] for item in path)
 
             return {
                 "zone": zone,
@@ -1143,10 +1049,10 @@ def zone_signal(zone, bars, volatility):
                 "sweep_time": int(sweep_bar["time"] + 300),
                 "sweep_open_time": int(sweep_bar["time"]),
                 "confirmation_level": level,
+                "score": score,
             }
 
     return None
-
 
 def m15_confirmation(candidate, bars):
     """

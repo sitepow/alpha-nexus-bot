@@ -188,3 +188,9 @@ KILLZONES_UTC = [
 MAX_SWEEP_WICK_RATIO = env_float("MAX_SWEEP_WICK_RATIO", 0.70)
 REQUIRE_CUMULATIVE_VOLUME_BUILDUP = env_bool("REQUIRE_CUMULATIVE_VOLUME_BUILDUP", True)
 VOL_BUILDUP_LOOKBACK = env_int("VOL_BUILDUP_LOOKBACK", 3)
+
+# ==========================================
+# PRO TRADING FEATURES
+# ==========================================
+SKIP_IDM_TRAP_ZONES = env_bool("SKIP_IDM_TRAP_ZONES", True)
+MIN_SCORING_THRESHOLD = env_float("MIN_SCORING_THRESHOLD", 6.0)
