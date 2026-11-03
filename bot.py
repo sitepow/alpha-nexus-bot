@@ -775,7 +775,7 @@ def calculate_scoring_logic(bars, zone, sweep_bar, confirmation_bar, reference_a
     return score
 
 def create_zones(bars, side):
-     """
+    """
     The impulse is the middle candle of a three-candle FVG.
 
     OB/FVG zones from that impulse become available only when the
@@ -914,7 +914,7 @@ def create_zones(bars, side):
 
     unique = {zone["local_id"]: zone for zone in result}
     return sorted(unique.values(), key=lambda zone: zone["created"], reverse=True)
-
+    
 def zone_signal(zone, bars, volatility):
     if not bars or bars[0]["time"] > zone["created"]:
         return None
@@ -1192,7 +1192,6 @@ def scan_symbol(broker, symbol, state):
         return candidate
 
     return None
-
 
 def floor_volume(volume, step):
     if step <= 0 or volume <= 0:
