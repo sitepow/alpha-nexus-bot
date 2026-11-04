@@ -200,3 +200,9 @@ MIN_SCORING_THRESHOLD = env_float("MIN_SCORING_THRESHOLD", 7.0)
 # ==========================================
 ENABLE_MITIGATION_BLOCK = env_bool("ENABLE_MITIGATION_BLOCK", True)
 MITIGATION_SCORE_BOOST = env_float("MITIGATION_SCORE_BOOST", 2.0)
+
+# ==========================================
+# 12. HARMONIC BAT PATTERN CONFLUENCE
+# ==========================================
+ENABLE_HARMONIC_BAT = env_bool("ENABLE_HARMONIC_BAT", True)
+HARMONIC_SCORE_BOOST = env_float("HARMONIC_SCORE_BOOST", 2.0)

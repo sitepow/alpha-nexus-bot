@@ -808,6 +808,61 @@ def first_structure_break(bars, index, side, volatility):
 
     return pivot if valid else None
 
+def check_harmonic_bat_pattern(bars, side):
+    highs, lows = swings(bars, CFG.STRUCTURE_SWING_WINDOW)
+    if len(highs) < 3 or len(lows) < 3:
+        return False
+
+    buy = side == "BUY"
+
+    if buy:
+        X = lows[-3]["price"]
+        A = highs[-2]["price"]
+        B = lows[-2]["price"]
+        C = highs[-1]["price"]
+        D = bars[-1]["low"]
+
+        XA = A - X
+        AB = A - B
+        XC = C - X
+        XD = C - D
+
+        if XA <= 0 or AB <= 0 or XC <= 0:
+            return False
+
+        b_ratio = (A - B) / XA
+        c_ratio = (C - B) / AB
+        d_ratio = (A - D) / XA
+
+        valid_b = 0.45 <= b_ratio <= 0.65
+        valid_c = 0.35 <= c_ratio <= 0.90
+        valid_d = 0.75 <= d_ratio <= 0.90
+
+        return valid_b and valid_c and valid_d
+    else:
+        X = highs[-3]["price"]
+        A = lows[-2]["price"]
+        B = highs[-2]["price"]
+        C = lows[-1]["price"]
+        D = bars[-1]["high"]
+
+        XA = X - A
+        AB = B - A
+        XC = X - C
+
+        if XA <= 0 or AB <= 0 or XC <= 0:
+            return False
+
+        b_ratio = (B - A) / XA
+        c_ratio = (B - C) / AB
+        d_ratio = (D - A) / XA
+
+        valid_b = 0.45 <= b_ratio <= 0.65
+        valid_c = 0.35 <= c_ratio <= 0.90
+        valid_d = 0.75 <= d_ratio <= 0.90
+
+        return valid_b and valid_c and valid_d
+
 def calculate_scoring_logic(bars, zone, sweep_bar, confirmation_bar, reference_atr, pdh=None, pdl=None):
     score = 0.0
     
@@ -844,6 +899,10 @@ def calculate_scoring_logic(bars, zone, sweep_bar, confirmation_bar, reference_a
             score += 2.0
         elif zone["side"] == "BUY" and abs(sweep_bar["low"] - pdl) <= reference_atr * 1.5:
             score += 2.0
+
+    if getattr(CFG, "ENABLE_HARMONIC_BAT", True):
+        if check_harmonic_bat_pattern(bars, zone["side"]):
+            score += getattr(CFG, "HARMONIC_SCORE_BOOST", 2.0)
 
     score += 1.5
     return min(score, 10.0)
