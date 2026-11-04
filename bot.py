@@ -794,7 +794,6 @@ def first_structure_break(bars, index, side, volatility):
     close = bars[index]["close"]
     buffer = CFG.BOS_BUFFER_ATR * volatility
 
-    # A previous close beyond the raw pivot consumes the first break.
     intervening = bars[pivot["confirmed_index"] + 1:index]
 
     if buy:
@@ -810,10 +809,11 @@ def first_structure_break(bars, index, side, volatility):
 
     return pivot if valid else None
 
-def calculate_scoring_logic(bars, zone, sweep_bar, confirmation_bar, reference_atr):
+def calculate_scoring_logic(bars, zone, sweep_bar, confirmation_bar, reference_atr, pdh=None, pdl=None):
     """
-    Multi-factor Scoring Logic (Alpha Flow inspired):
-    Weights confluence, wick rejection, volume buildup, and structural alignment.
+    Multi-factor Scoring Logic (Alpha Flow inspired & PDH/PDL Upgraded):
+    Weights confluence, wick rejection, volume buildup, structural alignment, 
+    and PDH/PDL False Break / Sweep behaviors.
     Returns a score out of 10.
     """
     score = 0.0
@@ -842,26 +842,19 @@ def calculate_scoring_logic(bars, zone, sweep_bar, confirmation_bar, reference_a
         if vm > 0 and confirmation_bar["volume"] >= vm * CFG.SWEEP_CONFIRM_VOLUME_MULTIPLIER:
             score += 2.5
 
-    score += 2.0
-    return score
+    if pdh is not None and pdl is not None:
+        if zone["side"] == "SELL" and abs(sweep_bar["high"] - pdh) <= reference_atr * 1.5:
+            score += 2.0
+        elif zone["side"] == "BUY" and abs(sweep_bar["low"] - pdl) <= reference_atr * 1.5:
+            score += 2.0
+
+    score += 1.5
+    return min(score, 10.0)
 
 def create_zones(bars, side):
-    """
-    The impulse is the middle candle of a three-candle FVG.
-
-    OB/FVG zones from that impulse become available only when the
-    third candle closes. Confluence means the same impulse, not
-    necessarily geometric overlap between OB and FVG.
-    
-    Upgraded zone creation: Includes advanced filtering to skip IDM (Inducement)
-    trap zones too close to current price, and dynamically shrinks FVG upon mitigation.
-    """
-
     volatility = atr(bars)
     buy = side == "BUY"
     result = []
-    vol_ma = volume_ma(bars, CFG.VOLUME_MA_PERIOD)
-    current_price = bars[-1]["close"]
 
     first = max(CFG.DEALING_RANGE_BARS + 1, len(bars) - CFG.ZONE_LOOKBACK)
 
@@ -959,7 +952,7 @@ def create_zones(bars, side):
     unique = {zone["local_id"]: zone for zone in result}
     return sorted(unique.values(), key=lambda zone: zone["created"], reverse=True)
 
-def zone_signal(zone, bars, volatility):
+def zone_signal(zone, bars, volatility, pdh=None, pdl=None):
     if not bars or bars[0]["time"] > zone["created"]:
         return None
 
@@ -1078,7 +1071,7 @@ def zone_signal(zone, bars, volatility):
             if not strong_close or body < CFG.CONFIRM_MIN_BODY_ATR * reference:
                 break
 
-            score = calculate_scoring_logic(bars, zone, sweep_bar, bar, reference)
+            score = calculate_scoring_logic(bars, zone, sweep_bar, bar, reference, pdh, pdl)
             if score < CFG.MIN_SCORING_THRESHOLD:
                 break
 
@@ -1101,12 +1094,6 @@ def zone_signal(zone, bars, volatility):
     return None
 
 def m15_confirmation(candidate, bars):
-    """
-    Require a completed M15 candle after the sweep to close through
-    an opposing M15 swing that was already known before the sweep.
-
-    This is an additional filter, not a deferred-entry state machine.
-    """
     if not CFG.REQUIRE_M15_CONFIRMATION:
         return True
 
@@ -1204,7 +1191,6 @@ def scan_symbol(broker, symbol, state):
 
     pdh, pdl = calculate_pdh_pdl(broker, symbol)
 
-    # Align all higher-timeframe information to the M5 decision time.
     h4 = [
         bar for bar in h4
         if bar["time"] + 14400 <= decision_time
@@ -1228,7 +1214,7 @@ def scan_symbol(broker, symbol, state):
         if zone_id in state["seen_zones"]:
             continue
 
-        candidate = zone_signal(zone, m5, volatility)
+        candidate = zone_signal(zone, m5, volatility, pdh, pdl)
 
         if candidate is None:
             continue
@@ -1835,8 +1821,6 @@ def resolve_pending(broker, state, path):
                 )
                 return
 
-            # For a full exit, wait until all reported fills are visible
-            # and the position is either gone or demonstrably reduced.
             remaining_position = next(
                 (
                     item for item in positions
@@ -2242,7 +2226,6 @@ def entry_permission(broker, state, snapshot, positions, orders):
     if not terminal.get("connected", False):
         return False, "The terminal is disconnected."
 
-    # Dry-run does not require permission to place real orders.
     if not CFG.DRY_RUN:
         if not account.get("trade_allowed", False):
             return False, "Account trading permission is unavailable."
@@ -2477,9 +2460,6 @@ def manage_positions(broker, state, path):
         if volatility <= 0:
             continue
 
-        # ==========================================
-        # Structural Trailing Stop (M5 Swings)
-        # ==========================================
         highs, lows = swings(bars, CFG.LTF_SWING_WINDOW)
         buffer = CFG.SL_BUFFER_ATR * volatility
         desired_sl = None
@@ -2568,7 +2548,6 @@ def main():
 
         mode = "dry" if CFG.DRY_RUN else "live"
 
-        # Keep the original filename for existing live-state continuity.
         state_path = ROOT / (
             f"bot_state_v2_{account_key}_{CFG.MAGIC}_{mode}.json"
         )
@@ -2691,7 +2670,6 @@ def main():
                     ):
                         continue
 
-                    # Build using the refreshed account and market tick.
                     built = build_order(
                         broker,
                         candidate,
@@ -2703,7 +2681,6 @@ def main():
 
                     request, estimated_loss = built
 
-                    # Final exposure check immediately before journaling.
                     final_positions = broker.positions()
                     final_orders = broker.orders()
 
@@ -2804,7 +2781,7 @@ def main():
         release_lock()
 
 
-if __name__ == "__main__":
+if __name__ ==__path == "__main__":
     try:
         main()
 
