@@ -142,6 +142,35 @@ def notify(message):
     except Exception:
         log("Telegram delivery failed.")
 
+def check_trendline_liquidity_sweep(bars, zone_side):
+    highs, lows = swings(bars, 2)
+    if len(highs) < 3 or len(lows) < 3:
+        return False
+
+    buy = zone_side == "BUY"
+    latest_bar = bars[-1]
+    prev_bar = bars[-2]
+
+    if buy:
+        recent_low = min(l["price"] for l in lows[-3:])
+        swept = prev_bar["low"] < recent_low and latest_bar["close"] > recent_low
+        return swept
+    else:
+        recent_high = max(h["price"] for h in highs[-3:])
+        swept = prev_bar["high"] > recent_high and latest_bar["close"] < recent_high
+        return swept
+
+def calculate_pdh_pdl(broker, symbol):
+    daily_bars = broker.bars(
+        symbol, broker.constant("TIMEFRAME_D1"), 3
+    )
+    if not daily_bars or len(daily_bars) < 2:
+        return None, None
+    
+    previous_day = daily_bars[-2]
+    pdh = previous_day["high"]
+    pdl = previous_day["low"]
+    return pdh, pdl
 
 def status(key, message, interval=300):
     now = time.time()
@@ -1156,6 +1185,8 @@ def scan_symbol(broker, symbol, state):
         symbol, broker.constant("TIMEFRAME_M15"), CFG.M15_BAR_COUNT
     )
 
+    pdh, pdl = calculate_pdh_pdl(broker, symbol)
+
     # Align all higher-timeframe information to the M5 decision time.
     h4 = [
         bar for bar in h4
@@ -1172,6 +1203,7 @@ def scan_symbol(broker, symbol, state):
         return None
 
     volatility = atr(m5)
+    current_price = m5[-1]["close"]
 
     for zone in create_zones(m15, side):
         zone_id = f"{symbol}:{zone['local_id']}"
@@ -1185,6 +1217,28 @@ def scan_symbol(broker, symbol, state):
             continue
 
         if not m15_confirmation(candidate, m15):
+            continue
+
+        score_boost = 0.0
+        is_pd_setup = False
+
+        if pdh is not None and pdl is not None:
+            if candidate["side"] == "SELL":
+                if current_price >= pdh - (volatility[-1] * 1.5):
+                    is_pd_setup = True
+                    score_boost += 2.0
+
+            elif candidate["side"] == "BUY":
+                if current_price <= pdl + (volatility[-1] * 1.5):
+                    is_pd_setup = True
+                    score_boost += 2.0
+
+        if check_trendline_liquidity_sweep(m5, candidate["side"]):
+            score_boost += 1.5
+
+        candidate["score"] = candidate.get("score", 6.0) + score_boost
+
+        if candidate["score"] < CFG.MIN_SCORING_THRESHOLD:
             continue
 
         candidate["symbol"] = symbol
