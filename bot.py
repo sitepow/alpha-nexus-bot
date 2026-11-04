@@ -809,12 +809,6 @@ def first_structure_break(bars, index, side, volatility):
     return pivot if valid else None
 
 def calculate_scoring_logic(bars, zone, sweep_bar, confirmation_bar, reference_atr, pdh=None, pdl=None):
-     """
-    Multi-factor Scoring Logic (Alpha Flow inspired & PDH/PDL Upgraded):
-    Weights confluence, wick rejection, volume buildup, structural alignment, 
-    and PDH/PDL False Break / Sweep behaviors.
-    Returns a score out of 10.
-    """
     score = 0.0
     
     if zone.get("is_mitigation", False):
