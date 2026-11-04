@@ -810,7 +810,7 @@ def first_structure_break(bars, index, side, volatility):
     return pivot if valid else None
 
 def calculate_scoring_logic(bars, zone, sweep_bar, confirmation_bar, reference_atr, pdh=None, pdl=None):
-    """
+     """
     Multi-factor Scoring Logic (Alpha Flow inspired & PDH/PDL Upgraded):
     Weights confluence, wick rejection, volume buildup, structural alignment, 
     and PDH/PDL False Break / Sweep behaviors.
@@ -829,7 +829,11 @@ def calculate_scoring_logic(bars, zone, sweep_bar, confirmation_bar, reference_a
     bar_range = sweep_bar["high"] - sweep_bar["low"]
     if bar_range > 0:
         buy = zone["side"] == "BUY"
-        wick_ratio = (sweep_bar["high"] - sweep_bar["close"]) / bar_range if buy else (sweep_bar["close"] - sweep_bar["low"]) / bar_range
+        wick_ratio = (
+            (sweep_bar["high"] - sweep_bar["close"]) / bar_range 
+            if buy 
+            else (sweep_bar["close"] - sweep_bar["low"]) / bar_range
+        )
         if wick_ratio >= 0.40:
             score += 2.5
         elif wick_ratio >= 0.20:
@@ -899,22 +903,27 @@ def create_zones(bars, side):
         if width <= 0:
             continue
 
+        if buy:
+            fibo_zone_top = range_high - (width * 0.618)
+            fibo_zone_bottom = range_high - (width * 0.786)
+        else:
+            fibo_zone_bottom = range_low + (width * 0.618)
+            fibo_zone_top = range_low + (width * 0.786)
+
         equilibrium = (range_high + range_low) / 2.0
-        pd_buffer = width * CFG.PD_EQUILIBRIUM_BUFFER
         created = int(right["time"] + 900)
 
         def add_zone(kind, bottom, top, source_index, is_mitigation=False):
             if bottom >= top:
                 return
+            
             midpoint = (bottom + top) / 2.0
 
             if buy:
-                tested = top if CFG.REQUIRE_FULL_ZONE_PD else midpoint
-                if tested > equilibrium - pd_buffer:
+                if not (fibo_zone_bottom <= midpoint <= fibo_zone_top):
                     return
             else:
-                tested = bottom if CFG.REQUIRE_FULL_ZONE_PD else midpoint
-                if tested < equilibrium + pd_buffer:
+                if not (fibo_zone_bottom <= midpoint <= fibo_zone_top):
                     return
 
             key = f"{side}:{kind}:{bars[source_index]['time']}:{created}"
