@@ -818,6 +818,9 @@ def calculate_scoring_logic(bars, zone, sweep_bar, confirmation_bar, reference_a
     """
     score = 0.0
     
+    if zone.get("is_mitigation", False):
+        score += CFG.MITIGATION_SCORE_BOOST
+    
     if zone.get("confluence", False):
         score += 3.0
     else:
@@ -840,7 +843,6 @@ def calculate_scoring_logic(bars, zone, sweep_bar, confirmation_bar, reference_a
             score += 2.5
 
     score += 2.0
-
     return score
 
 def create_zones(bars, side):
@@ -877,38 +879,16 @@ def create_zones(bars, side):
         if reference_atr <= 0:
             continue
 
-        if CFG.USE_VOLUME_FILTER:
-            reference_vol_ma = vol_ma[impulse_index] if impulse_index < len(vol_ma) else 0
-            if reference_vol_ma > 0 and impulse["volume"] < reference_vol_ma * CFG.DISPLACEMENT_VOLUME_MULTIPLIER:
-                continue
-
         body = abs(impulse["close"] - impulse["open"])
         candle_range = impulse["high"] - impulse["low"]
         directional = impulse["close"] > impulse["open"] if buy else impulse["close"] < impulse["open"]
 
-        if not directional or candle_range <= 0 or body < CFG.DISPLACEMENT_ATR * reference_atr or body / candle_range < CFG.DISPLACEMENT_BODY_RATIO:
+        if not directional or candle_range <= 0 or body < CFG.DISPLACEMENT_ATR * reference_atr:
             continue
 
         pivot = first_structure_break(bars, impulse_index, side, reference_atr)
         if pivot is None:
             continue
-
-        if buy:
-            gap_bottom = left["high"]
-            gap_top = right["low"]
-        else:
-            gap_bottom = right["high"]
-            gap_top = left["low"]
-
-        for b in bars[final_index + 1:]:
-            if buy:
-                if b["low"] <= gap_top:
-                    gap_bottom = max(gap_bottom, b["low"])
-            else:
-                if b["high"] >= gap_bottom:
-                    gap_top = min(gap_top, b["high"])
-
-        gap_valid = (gap_top - gap_bottom >= CFG.MIN_FVG_ATR * reference_atr)
 
         ob_index = None
         for source in range(impulse_index - 1, max(-1, impulse_index - CFG.OB_SEARCH_BACK - 1), -1):
@@ -917,9 +897,6 @@ def create_zones(bars, side):
             if opposite:
                 ob_index = source
                 break
-
-        if CFG.REQUIRE_OB_FVG_CONFLUENCE and (ob_index is None or not gap_valid):
-            continue
 
         dealing = bars[impulse_index - CFG.DEALING_RANGE_BARS:impulse_index]
         range_high = max(bar["high"] for bar in dealing)
@@ -933,31 +910,18 @@ def create_zones(bars, side):
         pd_buffer = width * CFG.PD_EQUILIBRIUM_BUFFER
         created = int(right["time"] + 900)
 
-        def add_zone(kind, bottom, top, source_index):
+        def add_zone(kind, bottom, top, source_index, is_mitigation=False):
             if bottom >= top:
                 return
-
             midpoint = (bottom + top) / 2.0
 
             if buy:
                 tested = top if CFG.REQUIRE_FULL_ZONE_PD else midpoint
                 if tested > equilibrium - pd_buffer:
                     return
-                if CFG.SKIP_IDM_TRAP_ZONES and abs(current_price - top) < (reference_atr * 1.5):
-                    return
             else:
                 tested = bottom if CFG.REQUIRE_FULL_ZONE_PD else midpoint
                 if tested < equilibrium + pd_buffer:
-                    return
-                if CFG.SKIP_IDM_TRAP_ZONES and abs(current_price - bottom) < (reference_atr * 1.5):
-                    return
-
-            # Reject OBs already breached before availability.
-            if kind == "OB":
-                path = bars[source_index + 1:final_index + 1]
-                if buy and any(bar["low"] < bottom for bar in path):
-                    return
-                if not buy and any(bar["high"] > top for bar in path):
                     return
 
             key = f"{side}:{kind}:{bars[source_index]['time']}:{created}"
@@ -971,19 +935,30 @@ def create_zones(bars, side):
                 "local_id": key,
                 "equilibrium": float(equilibrium),
                 "bos_level": float(pivot["price"]),
-                "confluence": bool(ob_index is not None and gap_valid),
+                "is_mitigation": bool(is_mitigation),
+                "confluence": True,
             })
 
-        if ob_index is not None:
+        if CFG.ENABLE_MITIGATION_BLOCK and ob_index is not None:
             source_bar = bars[ob_index]
-            add_zone("OB", source_bar["low"], source_bar["high"], ob_index)
-
-        if gap_valid:
-            add_zone("FVG", gap_bottom, gap_top, impulse_index)
+            path_after_ob = bars[ob_index + 1 : impulse_index]
+            broken_ob = False
+            for b in path_after_ob:
+                if buy and b["low"] < source_bar["low"]:
+                    broken_ob = True
+                    break
+                elif not buy and b["high"] > source_bar["high"]:
+                    broken_ob = True
+                    break
+            
+            if broken_ob:
+                add_zone("MITIGATION_BLOCK", source_bar["low"], source_bar["high"], ob_index, is_mitigation=True)
+            else:
+                add_zone("OB", source_bar["low"], source_bar["high"], ob_index, is_mitigation=False)
 
     unique = {zone["local_id"]: zone for zone in result}
     return sorted(unique.values(), key=lambda zone: zone["created"], reverse=True)
-    
+
 def zone_signal(zone, bars, volatility):
     if not bars or bars[0]["time"] > zone["created"]:
         return None

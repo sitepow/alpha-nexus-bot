@@ -194,3 +194,9 @@ VOL_BUILDUP_LOOKBACK = env_int("VOL_BUILDUP_LOOKBACK", 3)
 # ==========================================
 SKIP_IDM_TRAP_ZONES = env_bool("SKIP_IDM_TRAP_ZONES", True)
 MIN_SCORING_THRESHOLD = env_float("MIN_SCORING_THRESHOLD", 7.0)
+
+# ==========================================
+# 11. MITIGATION BLOCK & PRO FEATURES
+# ==========================================
+ENABLE_MITIGATION_BLOCK = env_bool("ENABLE_MITIGATION_BLOCK", True)
+MITIGATION_SCORE_BOOST = env_float("MITIGATION_SCORE_BOOST", 2.0)
