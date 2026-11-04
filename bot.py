@@ -76,13 +76,12 @@ def send_telegram_log_async(message):
     if not CFG.TELEGRAM_TOKEN or not CFG.TELEGRAM_CHAT_ID:
         return
     try:
-        formatted_text = f"<code>{safe_text(message)}</code>"
+        formatted_text = safe_text(message)
         requests.post(
             f"https://api.telegram.org/bot{CFG.TELEGRAM_TOKEN}/sendMessage",
             json={
                 "chat_id": CFG.TELEGRAM_CHAT_ID,
                 "text": formatted_text,
-                "parse_mode": "HTML",
                 "disable_web_page_preview": True,
             },
             timeout=5,
