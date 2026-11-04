@@ -62,6 +62,32 @@ try:
 except ImportError:
     fcntl = None
 
+class TelegramLogHandler(logging.Handler):
+    def emit(self, record):
+        try:
+            log_entry = self.format(record)
+            if record.levelno >= logging.INFO:
+                send_telegram_log_async(log_entry)
+        except Exception:
+            self.handleError(record)
+
+def send_telegram_log_async(message):
+    if not CFG.TELEGRAM_TOKEN or not CFG.TELEGRAM_CHAT_ID:
+        return
+    try:
+        formatted_text = f"<code>{safe_text(message)}</code>"
+        requests.post(
+            f"https://api.telegram.org/bot{CFG.TELEGRAM_TOKEN}/sendMessage",
+            json={
+                "chat_id": CFG.TELEGRAM_CHAT_ID,
+                "text": formatted_text,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+            },
+            timeout=5,
+        )
+    except Exception:
+        pass
 
 ROOT = Path(__file__).resolve().parent
 load_dotenv(ROOT / ".env")
@@ -2546,6 +2572,16 @@ def validate_account(broker, expected_key):
 def main():
     validate_config()
     broker = None
+
+    if CFG.TELEGRAM_TOKEN and CFG.TELEGRAM_CHAT_ID:
+        root_logger = logging.getLogger()
+        root_logger.setLevel(logging.INFO)
+        
+        if not any(isinstance(h, TelegramLogHandler) for h in root_logger.handlers):
+            tg_handler = TelegramLogHandler()
+            formatter = logging.Formatter("%(asctime)s UTC | %(levelname)s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+            tg_handler.setFormatter(formatter)
+            root_logger.addHandler(tg_handler)
 
     try:
         broker = Broker()
