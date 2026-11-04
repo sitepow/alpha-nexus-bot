@@ -138,9 +138,7 @@ def safe_text(text):
 
 
 def log(message):
-    stamp = utc_now().strftime("%Y-%m-%d %H:%M:%S UTC")
-    print(f"[{stamp}] {safe_text(message)}", flush=True)
-
+    logging.info(safe_text(message))
 
 def notify(message):
     message = safe_text(message)
