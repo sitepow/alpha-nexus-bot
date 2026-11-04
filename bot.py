@@ -2781,7 +2781,7 @@ def main():
         release_lock()
 
 
-if __name__ ==__path == "__main__":
+if __name__ == "__main__":
     try:
         main()
 
