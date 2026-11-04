@@ -142,6 +142,21 @@ def notify(message):
     except Exception:
         log("Telegram delivery failed.")
 
+def get_dynamic_sweep_atr(symbol, base_atr):
+    if not symbol:
+        return base_atr * CFG.SWEEP_MIN_ATR
+        
+    symbol_upper = symbol.upper()
+    
+    if "XAU" in symbol_upper or "BTC" in symbol_upper or "ETH" in symbol_upper:
+        multiplier = 0.40
+    elif "30" in symbol_upper or "TEC" in symbol_upper or "OIL" in symbol_upper:
+        multiplier = 0.35
+    else:
+        multiplier = 0.20
+        
+    return max(0.15, base_atr * multiplier)
+
 def check_trendline_liquidity_sweep(bars, zone_side):
     highs, lows = swings(bars, 2)
     if len(highs) < 3 or len(lows) < 3:
@@ -1023,14 +1038,16 @@ def zone_signal(zone, bars, volatility):
         if already_taken:
             continue
 
+        dynamic_sweep_min = get_dynamic_sweep_atr(zone["symbol"] if "symbol" in zone else "EURUSD", reference_atr)
+
         if buy:
             swept = (
-                sweep_bar["low"] < liquidity["price"] - CFG.SWEEP_MIN_ATR * reference_atr
+                sweep_bar["low"] < liquidity["price"] - dynamic_sweep_min
                 and sweep_bar["close"] > liquidity["price"]
             )
         else:
             swept = (
-                sweep_bar["high"] > liquidity["price"] + CFG.SWEEP_MIN_ATR * reference_atr
+                sweep_bar["high"] > liquidity["price"] + dynamic_sweep_min
                 and sweep_bar["close"] < liquidity["price"]
             )
 
