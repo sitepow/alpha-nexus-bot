@@ -37,6 +37,7 @@ Limitations:
 Application-authored messages and comments are English.
 """
 
+import logging
 import hashlib
 import json
 import math
