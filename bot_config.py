@@ -183,7 +183,7 @@ SWEEP_CONFIRM_VOLUME_MULTIPLIER = env_float("SWEEP_CONFIRM_VOLUME_MULTIPLIER", 1
 USE_KILLZONES_ONLY = env_bool("USE_KILLZONES_ONLY", True)
 KILLZONES_UTC = [
     (7, 10),   # London Open / Expansion
-    (12, 15),  # New York Open / Overlap
+    (12, 16),  # New York Open / Overlap
 ]
 MAX_SWEEP_WICK_RATIO = env_float("MAX_SWEEP_WICK_RATIO", 0.70)
 REQUIRE_CUMULATIVE_VOLUME_BUILDUP = env_bool("REQUIRE_CUMULATIVE_VOLUME_BUILDUP", True)
