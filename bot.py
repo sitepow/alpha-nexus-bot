@@ -168,18 +168,18 @@ def notify(message):
 
 def get_dynamic_sweep_atr(symbol, base_atr):
     if not symbol:
-        return base_atr * CFG.SWEEP_MIN_ATR
+        return base_atr * 0.10
         
     symbol_upper = symbol.upper()
     
     if "XAU" in symbol_upper or "BTC" in symbol_upper or "ETH" in symbol_upper:
-        multiplier = 0.40
+        multiplier = 0.12
     elif "30" in symbol_upper or "TEC" in symbol_upper or "OIL" in symbol_upper:
-        multiplier = 0.35
-    else:
         multiplier = 0.20
+    else:
+        multiplier = 0.10
         
-    return max(0.15, base_atr * multiplier)
+    return max(0.08, base_atr * multiplier)
 
 def check_trendline_liquidity_sweep(bars, zone_side):
     highs, lows = swings(bars, 2)
@@ -867,7 +867,7 @@ def calculate_scoring_logic(bars, zone, sweep_bar, confirmation_bar, reference_a
     score = 0.0
     
     if zone.get("is_mitigation", False):
-        score += CFG.MITIGATION_SCORE_BOOST
+        score += getattr(CFG, "MITIGATION_SCORE_BOOST", 2.0)
     
     if zone.get("confluence", False):
         score += 3.0
@@ -1020,8 +1020,10 @@ def zone_signal(zone, bars, volatility, pdh=None, pdl=None):
     latest = len(bars) - 1
     decision_time = bars[-1]["time"] + 300
 
+    signal_score_modifier = 0.0
+
     if decision_time - zone["created"] > CFG.MAX_ZONE_AGE_M15_BARS * 900:
-        return None
+        signal_score_modifier -= 2.0
 
     buy = zone["side"] == "BUY"
     eligible = [index for index, bar in enumerate(bars) if bar["time"] >= zone["created"]]
@@ -1036,14 +1038,17 @@ def zone_signal(zone, bars, volatility, pdh=None, pdl=None):
             touch = index
             break
 
-    if touch is None or touch < 40 or latest - touch > CFG.MAX_TOUCH_WAIT_BARS:
+    if touch is None:
         return None
+
+    if latest - touch > CFG.MAX_TOUCH_WAIT_BARS:
+        signal_score_modifier -= 1.5
 
     for bar in bars[touch:]:
         if buy and bar["close"] < zone["bottom"]:
-            return None
+            signal_score_modifier -= 3.0
         if not buy and bar["close"] > zone["top"]:
-            return None
+            signal_score_modifier -= 3.0
 
     sweep_end = min(touch + CFG.SWEEP_AFTER_TOUCH_BARS, latest - 1)
 
@@ -1066,7 +1071,7 @@ def zone_signal(zone, bars, volatility, pdh=None, pdl=None):
                 else (sweep_bar["close"] - sweep_bar["low"]) / bar_range
             )
             if wick_ratio > CFG.MAX_SWEEP_WICK_RATIO:
-                continue
+                signal_score_modifier -= 1.0
 
         overlaps = sweep_bar["low"] <= zone["top"] and sweep_bar["high"] >= zone["bottom"]
         if not overlaps:
@@ -1081,8 +1086,11 @@ def zone_signal(zone, bars, volatility, pdh=None, pdl=None):
             liquidity = highs[-1]
             confirmation = lows[-1]
 
-        if not counter_structure or sweep_index - liquidity["index"] > CFG.LIQUIDITY_MAX_AGE:
-            continue
+        if not counter_structure:
+            signal_score_modifier -= 1.5
+
+        if sweep_index - liquidity["index"] > CFG.LIQUIDITY_MAX_AGE:
+            signal_score_modifier -= 1.0
 
         intervening = bars[liquidity["confirmed_index"] + 1:sweep_index]
         already_taken = any(
@@ -1090,7 +1098,7 @@ def zone_signal(zone, bars, volatility, pdh=None, pdl=None):
             for bar in intervening
         )
         if already_taken:
-            continue
+            signal_score_modifier -= 1.5
 
         dynamic_sweep_min = get_dynamic_sweep_atr(zone["symbol"] if "symbol" in zone else "EURUSD", reference_atr)
 
@@ -1106,7 +1114,7 @@ def zone_signal(zone, bars, volatility, pdh=None, pdl=None):
             )
 
         if not swept:
-            continue
+            signal_score_modifier -= 1.0
 
         level = confirmation["price"]
         confirmation_end = min(sweep_index + CFG.CONFIRM_AFTER_SWEEP_BARS, latest)
@@ -1115,9 +1123,8 @@ def zone_signal(zone, bars, volatility, pdh=None, pdl=None):
             bar = bars[confirmation_index]
             raw_break = bar["close"] > level if buy else bar["close"] < level
             if not raw_break:
+                signal_score_modifier -= 0.5
                 continue
-            if confirmation_index != latest:
-                break
 
             reference = volatility[confirmation_index - 1]
             close_buffer = CFG.CONFIRM_CLOSE_BUFFER_ATR * reference
@@ -1129,11 +1136,15 @@ def zone_signal(zone, bars, volatility, pdh=None, pdl=None):
                 else (bar["close"] < level - close_buffer and bar["close"] < bar["open"])
             )
 
-            if not strong_close or body < CFG.CONFIRM_MIN_BODY_ATR * reference:
-                break
+            if not strong_close:
+                signal_score_modifier -= 1.0
+            if body < CFG.CONFIRM_MIN_BODY_ATR * reference:
+                signal_score_modifier -= 1.0
 
             score = calculate_scoring_logic(bars, zone, sweep_bar, bar, reference, pdh, pdl)
-            if score < CFG.MIN_SCORING_THRESHOLD:
+            final_score = score + signal_score_modifier
+
+            if final_score < CFG.MIN_SCORING_THRESHOLD:
                 break
 
             path = bars[touch:confirmation_index + 1]
@@ -1149,67 +1160,27 @@ def zone_signal(zone, bars, volatility, pdh=None, pdl=None):
                 "sweep_time": int(sweep_bar["time"] + 300),
                 "sweep_open_time": int(sweep_bar["time"]),
                 "confirmation_level": level,
-                "score": score,
+                "score": final_score,
             }
 
     return None
 
 def m15_confirmation(candidate, bars):
-    if not CFG.REQUIRE_M15_CONFIRMATION:
-        return True
-
-    sweep_open = candidate["sweep_open_time"]
-
-    before = [
-        bar
-        for bar in bars
-        if bar["time"] + 900 <= sweep_open
-    ]
-
-    highs, lows = swings(before, CFG.STRUCTURE_SWING_WINDOW)
-    buy = candidate["side"] == "BUY"
-    pivots = highs if buy else lows
-
-    if not pivots:
-        return False
-
-    pivot = pivots[-1]
-    level = pivot["price"]
-
-    if any(
-        bar["close"] > level
-        if buy
-        else bar["close"] < level
-        for bar in before[pivot["confirmed_index"] + 1:]
-    ):
-        return False
+    if not CFG.ENABLE_M15_SCORE_BOOST:
+        return 0.0
 
     if not bars:
-        return False
+        return 0.0
 
     latest = bars[-1]
+    buy = candidate["side"] == "BUY"
+    
+    if buy and latest["close"] >= latest["open"]:
+        return getattr(CFG, "M15_SCORE_BOOST_VALUE", 1.5)
+    elif not buy and latest["close"] <= latest["open"]:
+        return getattr(CFG, "M15_SCORE_BOOST_VALUE", 1.5)
 
-    if latest["time"] + 900 < candidate["sweep_time"]:
-        return False
-
-    volatility = atr(bars)
-
-    if len(volatility) < 2 or volatility[-2] <= 0:
-        return False
-
-    buffer = CFG.BOS_BUFFER_ATR * volatility[-2]
-
-    if buy:
-        return (
-            latest["close"] > level + buffer
-            and latest["close"] > latest["open"]
-        )
-
-    return (
-        latest["close"] < level - buffer
-        and latest["close"] < latest["open"]
-    )
-
+    return 0.0
 
 def parse_utc_timestamp(value):
     if not isinstance(value, str):
@@ -1223,7 +1194,50 @@ def parse_utc_timestamp(value):
     return stamp.astimezone(timezone.utc).timestamp()
 
 
+def get_news_score_penalty(symbol):
+    if not getattr(CFG, "ENABLE_NEWS_SCORING_PENALTY", False):
+        return 0.0
+
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    clean = re.sub(r"[^A-Z]", "", symbol.upper())
+    if len(clean) < 6:
+        return 0.0
+    clean = clean[:6]
+
+    currencies = {clean[:3], clean[3:6]}
+    related = set()
+    if "USD" in currencies:
+        related.update(["EUR", "GBP", "JPY", "AUD", "NZD", "CAD", "CHF", "XAU", "XAG"])
+    if "EUR" in currencies:
+        related.update(["USD", "GBP", "CHF"])
+    if "GBP" in currencies:
+        related.update(["USD", "EUR"])
+    if "JPY" in currencies:
+        related.update(["USD"])
+    currencies.update(related)
+
+    penalty = 0.0
+
+    with SHARED_NEWS_FETCHER._lock:
+        for news in SHARED_NEWS_FETCHER.high_impact_news:
+            if news["currency"] not in currencies:
+                continue
+            
+            impact_buffer = CFG.NEWS_HIGH_IMPACT_BUFFER_MIN if news["impact"] == "High" else 15
+            diff = (news["time"] - now).total_seconds() / 60
+
+            if -impact_buffer <= diff <= impact_buffer:
+                if news["impact"] == "High":
+                    penalty = max(penalty, CFG.NEWS_HIGH_IMPACT_PENALTY)
+                else:
+                    penalty = max(penalty, CFG.NEWS_MEDIUM_IMPACT_PENALTY)
+
+    return penalty
+
 def news_permission(broker, symbol):
+    if getattr(CFG, "ENABLE_NEWS_SCORING_PENALTY", False):
+        return True, "News penalty scoring mode active."
+
     if not CFG.ENABLE_NEWS_FILTER:
         return True, "News filter disabled."
 
@@ -1280,10 +1294,9 @@ def scan_symbol(broker, symbol, state):
         if candidate is None:
             continue
 
-        if not m15_confirmation(candidate, m15):
-            continue
+        m15_bonus = m15_confirmation(candidate, m15)
 
-        score_boost = 0.0
+        score_boost = m15_bonus
         is_pd_setup = False
 
         if pdh is not None and pdl is not None:
@@ -1301,6 +1314,9 @@ def scan_symbol(broker, symbol, state):
             score_boost += 1.5
 
         candidate["score"] = candidate.get("score", 6.0) + score_boost
+
+        news_penalty = get_news_score_penalty(symbol)
+        candidate["score"] -= news_penalty
 
         if candidate["score"] < CFG.MIN_SCORING_THRESHOLD:
             continue

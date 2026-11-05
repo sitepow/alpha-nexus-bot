@@ -126,14 +126,14 @@ PD_EQUILIBRIUM_BUFFER = env_float("PD_EQUILIBRIUM_BUFFER", 0.02)
 
 MAX_ZONE_AGE_M15_BARS = env_int("MAX_ZONE_AGE_M15_BARS", 32)
 LIQUIDITY_MAX_AGE = env_int("LIQUIDITY_MAX_AGE", 30)
-SWEEP_MIN_ATR = env_float("SWEEP_MIN_ATR", 0.25)
+SWEEP_MIN_ATR = env_float("SWEEP_MIN_ATR", 0.15)
 SWEEP_AFTER_TOUCH_BARS = env_int("SWEEP_AFTER_TOUCH_BARS", 3)
 CONFIRM_AFTER_SWEEP_BARS = env_int("CONFIRM_AFTER_SWEEP_BARS", 6)
 MAX_TOUCH_WAIT_BARS = env_int("MAX_TOUCH_WAIT_BARS", 9)
 
 CONFIRM_CLOSE_BUFFER_ATR = env_float("CONFIRM_CLOSE_BUFFER_ATR", 0.05)
 CONFIRM_MIN_BODY_ATR = env_float("CONFIRM_MIN_BODY_ATR", 0.10)
-REQUIRE_M15_CONFIRMATION = env_bool("REQUIRE_M15_CONFIRMATION", True)
+REQUIRE_M15_CONFIRMATION = env_bool("REQUIRE_M15_CONFIRMATION", False)
 
 SL_BUFFER_ATR = env_float("SL_BUFFER_ATR", 0.30)
 MAX_SL_ATR = env_float("MAX_SL_ATR", 3.0)
@@ -180,7 +180,7 @@ SWEEP_CONFIRM_VOLUME_MULTIPLIER = env_float("SWEEP_CONFIRM_VOLUME_MULTIPLIER", 1
 # 9. SESSION & KILLZONE SETTINGS
 # ==========================================
 
-USE_KILLZONES_ONLY = env_bool("USE_KILLZONES_ONLY", True)
+USE_KILLZONES_ONLY = env_bool("USE_KILLZONES_ONLY", False)
 KILLZONES_UTC = [
     (7, 10),   # London Open / Expansion
     (12, 16),  # New York Open / Overlap
@@ -193,7 +193,7 @@ VOL_BUILDUP_LOOKBACK = env_int("VOL_BUILDUP_LOOKBACK", 3)
 # 10. PRO TRADING FEATURES
 # ==========================================
 SKIP_IDM_TRAP_ZONES = env_bool("SKIP_IDM_TRAP_ZONES", True)
-MIN_SCORING_THRESHOLD = env_float("MIN_SCORING_THRESHOLD", 7.0)
+MIN_SCORING_THRESHOLD = env_float("MIN_SCORING_THRESHOLD", 4.0)
 
 # ==========================================
 # 11. MITIGATION BLOCK & PRO FEATURES
@@ -206,3 +206,16 @@ MITIGATION_SCORE_BOOST = env_float("MITIGATION_SCORE_BOOST", 2.0)
 # ==========================================
 ENABLE_HARMONIC_BAT = env_bool("ENABLE_HARMONIC_BAT", True)
 HARMONIC_SCORE_BOOST = env_float("HARMONIC_SCORE_BOOST", 2.0)
+
+# ==========================================
+# 13. M15 SCORE BOOST SETTINGS
+# ==========================================
+ENABLE_M15_SCORE_BOOST = env_bool("ENABLE_M15_SCORE_BOOST", True)
+M15_SCORE_BOOST_VALUE = env_float("M15_SCORE_BOOST_VALUE", 1.5)
+
+# ==========================================
+# 14. NEWS SCORING PENALTY SETTINGS
+# ==========================================
+ENABLE_NEWS_SCORING_PENALTY = env_bool("ENABLE_NEWS_SCORING_PENALTY", True)
+NEWS_HIGH_IMPACT_PENALTY = env_float("NEWS_HIGH_IMPACT_PENALTY", 4.0)
+NEWS_MEDIUM_IMPACT_PENALTY = env_float("NEWS_MEDIUM_IMPACT_PENALTY", 2.0)
