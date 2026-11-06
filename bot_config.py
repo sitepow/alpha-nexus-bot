@@ -44,7 +44,12 @@ SYMBOLS = [
     item.strip()
     for item in os.getenv(
         "SYMBOLS",
-        "EURUSD,GBPUSD,USDJPY,AUDUSD,USDCAD,NZDUSD,XAUUSD,XAGUSD,USOIL,UKOIL,US30,USTEC,DE30,BTCUSD,ETHUSD,SOLUSD"
+        "EURUSD,GBPUSD,USDJPY,AUDUSD,USDCAD,NZDUSD,USDCHF,"
+        "EURGBP,EURJPY,GBPJPY,AUDJPY,GBPCAD,EURAUD,EURNZD,GBPNZD,AUDNZD,CADJPY,CHFJPY,"
+        "USDZAR,USDMXN,USDSGD,USDTRY,"
+        "XAUUSD,XAGUSD,XPTUSD,XPDUSD,USOIL,UKOIL,NATGAS,COPPER,"
+        "US30,USTEC,US500,DE30,FR40,UK100,JP225,HK50,AU200,"
+        "BTCUSD,ETHUSD,SOLUSD,XRPUSD,BNBUSD,ADAUSD,DOGEUSD,AVAXUSD,LINKUSD,DOTUSD"
     ).split(",")
     if item.strip()
 ]
@@ -77,10 +82,39 @@ MAX_CONSECUTIVE_LOSSES = env_int("MAX_CONSECUTIVE_LOSSES", 3)
 COOLDOWN_SECONDS = env_float("COOLDOWN_SECONDS", 3600)
 
 MAX_SPREAD_POINTS = env_float("MAX_SPREAD_POINTS", 30)
+MAX_SPREAD_POINTS = env_float("MAX_SPREAD_POINTS", 30)
 MAX_SPREAD_BY_SYMBOL = json.loads(
     os.getenv(
         "MAX_SPREAD_BY_SYMBOL_JSON",
-        '{"XAUUSD": 80, "US30": 100, "USTEC": 100, "USOIL": 60, "BTCUSD": 150}'
+        json.dumps({
+            "XAUUSD": 80, 
+            "XAGUSD": 50, 
+            "XPTUSD": 70, 
+            "XPDUSD": 70, 
+            "USOIL": 60, 
+            "UKOIL": 60, 
+            "NATGAS": 80, 
+            "COPPER": 60,
+            "US30": 100, 
+            "USTEC": 100, 
+            "US500": 80, 
+            "DE30": 80, 
+            "FR40": 80, 
+            "UK100": 80, 
+            "JP225": 120, 
+            "HK50": 120, 
+            "AU200": 80,
+            "BTCUSD": 250, 
+            "ETHUSD": 150, 
+            "SOLUSD": 100, 
+            "XRPUSD": 80, 
+            "BNBUSD": 100, 
+            "ADAUSD": 80, 
+            "DOGEUSD": 80, 
+            "AVAXUSD": 100, 
+            "LINKUSD": 80, 
+            "DOTUSD": 80
+        })
     )
 )
 
