@@ -92,8 +92,8 @@ MAX_CLOSED_M5_AGE_SECONDS = env_float("MAX_CLOSED_M5_AGE_SECONDS", 420)
 # ==========================================
 # 5. SESSION & TIME EXIT SETTINGS
 # ==========================================
-SESSION_START_HOUR_UTC = env_int("SESSION_START_HOUR_UTC", 6)
-SESSION_END_HOUR_UTC = env_int("SESSION_END_HOUR_UTC", 20)
+SESSION_START_HOUR_UTC = env_int("SESSION_START_HOUR_UTC", 0)
+SESSION_END_HOUR_UTC = env_int("SESSION_END_HOUR_UTC", 0)
 
 ENABLE_TIME_EXIT = env_bool("ENABLE_TIME_EXIT", True)
 TIME_EXIT_MINUTES = env_float("TIME_EXIT_MINUTES", 90)
