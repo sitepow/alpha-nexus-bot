@@ -654,9 +654,16 @@ class Broker:
         return float(value)
 
     def select_symbols(self):
+        valid_symbols = []
         for symbol in CFG.SYMBOLS:
-            if not self.read(f"mt5.symbol_select({symbol!r}, True)"):
-                raise FatalError("A configured symbol cannot be selected.")
+            success = self.read(f"mt5.symbol_select({symbol!r}, True)")
+            if success:
+                valid_symbols.append(symbol)
+            else:
+                print(f"--- [WARNING] Symbol {symbol} cannot be selected and will be skipped. ---", flush=True)
+        CFG.SYMBOLS = valid_symbols
+        if not CFG.SYMBOLS:
+            raise FatalError("No valid symbols could be selected.")
 
     def shutdown(self):
         self.mt5.shutdown()
