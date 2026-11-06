@@ -47,8 +47,8 @@ SYMBOLS = [
         "EURUSD,GBPUSD,USDJPY,AUDUSD,USDCAD,NZDUSD,USDCHF,"
         "EURGBP,EURJPY,GBPJPY,AUDJPY,GBPCAD,EURAUD,EURNZD,GBPNZD,AUDNZD,CADJPY,CHFJPY,"
         "XAUUSD,XAGUSD,XPTUSD,XPDUSD,USOIL,UKOIL,XNGUSD,XCUUSD,"
-        "US30,USTEC,US500,DE30,FR40,UK100,JP225,HK50,AU200,"
-        "BTCUSD,ETHUSD,SOLUSD,XRPUSD,BNBUSD,ADAUSD,DOGEUSD,AVAXUSD,LINKUSD,DOTUSD"
+        "US30,USTEC,US500,DE30,FR40,UK100,JP225,HK50,AUS200,"
+        "BTCUSD,ETHUSD,SOLUSD,XRPUSD,BNBUSD,ADAUSD,DOGEUSD,LINKUSD,DOTUSD"
     ).split(",")
     if item.strip()
 ]
@@ -102,7 +102,7 @@ MAX_SPREAD_BY_SYMBOL = json.loads(
             "UK100": 80, 
             "JP225": 120, 
             "HK50": 120, 
-            "AU200": 80,
+            "AUS200": 80,
             "BTCUSD": 250, 
             "ETHUSD": 150, 
             "SOLUSD": 100, 
@@ -110,7 +110,6 @@ MAX_SPREAD_BY_SYMBOL = json.loads(
             "BNBUSD": 100, 
             "ADAUSD": 80, 
             "DOGEUSD": 80, 
-            "AVAXUSD": 100, 
             "LINKUSD": 80, 
             "DOTUSD": 80
         })
