@@ -178,7 +178,7 @@ TRAIL_ATR = env_float("TRAIL_ATR", 1.2)
 # ==========================================
 # 7. NEWS FETCHER & FILTER SETTINGS
 # ==========================================
-ENABLE_NEWS_FILTER = env_bool("ENABLE_NEWS_FILTER", False)
+ENABLE_NEWS_FILTER = env_bool("ENABLE_NEWS_FILTER", True)
 NEWS_BEFORE_MINUTES = env_float("NEWS_BEFORE_MINUTES", 15)
 NEWS_AFTER_MINUTES = env_float("NEWS_AFTER_MINUTES", 15)
 NEWS_FILE_MAX_AGE_HOURS = env_float("NEWS_FILE_MAX_AGE_HOURS", 24)
@@ -225,7 +225,7 @@ VOL_BUILDUP_LOOKBACK = env_int("VOL_BUILDUP_LOOKBACK", 3)
 # 10. PRO TRADING FEATURES
 # ==========================================
 SKIP_IDM_TRAP_ZONES = env_bool("SKIP_IDM_TRAP_ZONES", True)
-MIN_SCORING_THRESHOLD = env_float("MIN_SCORING_THRESHOLD", 4.0)
+MIN_SCORING_THRESHOLD = env_float("MIN_SCORING_THRESHOLD", 3.5)
 
 # ==========================================
 # 11. MITIGATION BLOCK & PRO FEATURES
@@ -248,6 +248,6 @@ M15_SCORE_BOOST_VALUE = env_float("M15_SCORE_BOOST_VALUE", 1.5)
 # ==========================================
 # 14. NEWS SCORING PENALTY SETTINGS
 # ==========================================
-ENABLE_NEWS_SCORING_PENALTY = env_bool("ENABLE_NEWS_SCORING_PENALTY", False)
+ENABLE_NEWS_SCORING_PENALTY = env_bool("ENABLE_NEWS_SCORING_PENALTY", True)
 NEWS_HIGH_IMPACT_PENALTY = env_float("NEWS_HIGH_IMPACT_PENALTY", 4.0)
 NEWS_MEDIUM_IMPACT_PENALTY = env_float("NEWS_MEDIUM_IMPACT_PENALTY", 2.0)
