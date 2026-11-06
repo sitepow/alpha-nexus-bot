@@ -2693,12 +2693,7 @@ def main():
                     time.sleep(CFG.POLL_SECONDS)
                     continue
 
-                scanned_symbols_count = 0
-                found_signals_count = 0
-                scan_summary_lines = []
-
                 for symbol in CFG.SYMBOLS:
-                    scanned_symbols_count += 1
                     print(f"--- [SCANNING] Checking symbol: {symbol} ---", flush=True)
 
                     snapshot = daily_snapshot(
@@ -2712,7 +2707,6 @@ def main():
                     )
 
                     if not permitted:
-                        scan_summary_lines.append(f"• {symbol}: Skipped ({reason})")
                         status("entry_gate", reason)
                         break
 
@@ -2720,7 +2714,6 @@ def main():
                         item["symbol"] == symbol
                         for item in positions + orders
                     ):
-                        scan_summary_lines.append(f"• {symbol}: Skipped (Active order/position exists)")
                         continue
 
                     news_ok, news_reason = news_permission(
@@ -2728,7 +2721,6 @@ def main():
                     )
 
                     if not news_ok:
-                        scan_summary_lines.append(f"• {symbol}: Skipped (News restriction)")
                         status(
                             f"news_{symbol}",
                             f"{symbol}: {news_reason}",
@@ -2741,11 +2733,7 @@ def main():
                     )
 
                     if candidate is None:
-                        scan_summary_lines.append(f"• {symbol}: Normal (No signal)")
                         continue
-
-                    found_signals_count += 1
-                    scan_summary_lines.append(f"🔥 {symbol}: Signal Found! ({candidate['side']} / Score: {candidate['score']:.2f})")
 
                     if CFG.TELEGRAM_TOKEN and CFG.TELEGRAM_CHAT_ID:
                         try:
@@ -2873,27 +2861,6 @@ def main():
                     )
 
                     break
-
-                summary_text = (
-                    f"📊 Scan Summary Round\n"
-                    f"• Checked symbols: {scanned_symbols_count}\n"
-                    f"• Signals found: {found_signals_count}\n\n" +
-                    "\n".join(scan_summary_lines)
-                )
-                
-                if CFG.TELEGRAM_TOKEN and CFG.TELEGRAM_CHAT_ID:
-                    try:
-                        requests.post(
-                            f"https://api.telegram.org/bot{CFG.TELEGRAM_TOKEN}/sendMessage",
-                            json={
-                                "chat_id": CFG.TELEGRAM_CHAT_ID,
-                                "text": safe_text(summary_text),
-                                "disable_web_page_preview": True,
-                            },
-                            timeout=10,
-                        )
-                    except Exception:
-                        pass
 
                 time.sleep(CFG.POLL_SECONDS)
 
