@@ -2690,7 +2690,7 @@ def main():
 
                 for symbol in CFG.SYMBOLS:
                     scanned_symbols_count += 1
-                    print(f"--- [SCANNING] กำลังตรวจเช็ก: {symbol} ---", flush=True)
+                    print(f"--- [SCANNING] Checking symbol: {symbol} ---", flush=True)
 
                     snapshot = daily_snapshot(
                         broker, state, state_path
@@ -2703,7 +2703,7 @@ def main():
                     )
 
                     if not permitted:
-                        scan_summary_lines.append(f"• {symbol}: ข้าม ({reason})")
+                        scan_summary_lines.append(f"• {symbol}: Skipped ({reason})")
                         status("entry_gate", reason)
                         break
 
@@ -2711,7 +2711,7 @@ def main():
                         item["symbol"] == symbol
                         for item in positions + orders
                     ):
-                        scan_summary_lines.append(f"• {symbol}: ข้าม (มีออร์เดอร์ค้างอยู่)")
+                        scan_summary_lines.append(f"• {symbol}: Skipped (Active order/position exists)")
                         continue
 
                     news_ok, news_reason = news_permission(
@@ -2719,7 +2719,7 @@ def main():
                     )
 
                     if not news_ok:
-                        scan_summary_lines.append(f"• {symbol}: ข้าม (ติดข่าว)")
+                        scan_summary_lines.append(f"• {symbol}: Skipped (News restriction)")
                         status(
                             f"news_{symbol}",
                             f"{symbol}: {news_reason}",
@@ -2732,19 +2732,31 @@ def main():
                     )
 
                     if candidate is None:
-                        scan_summary_lines.append(f"• {symbol}: ปกติ (ไม่พบสัญญาณ)")
+                        scan_summary_lines.append(f"• {symbol}: Normal (No signal)")
                         continue
 
                     found_signals_count += 1
-                    scan_summary_lines.append(f"🔥 {symbol}: พบสัญญาณ! ({candidate['side']} / Score: {candidate['score']:.2f})")
+                    scan_summary_lines.append(f"🔥 {symbol}: Signal Found! ({candidate['side']} / Score: {candidate['score']:.2f})")
 
-                    notify(
-                        f"🎯 พบสัญญาณเทรด (Signal Found)!\n"
-                        f"Symbol: {symbol}\n"
-                        f"Side: {candidate['side']}\n"
-                        f"Zone: {candidate['zone']['kind']}\n"
-                        f"Score: {candidate['score']:.2f} / {CFG.MIN_SCORING_THRESHOLD}"
-                    )
+                    if CFG.TELEGRAM_TOKEN and CFG.TELEGRAM_CHAT_ID:
+                        try:
+                            requests.post(
+                                f"https://api.telegram.org/bot{CFG.TELEGRAM_TOKEN}/sendMessage",
+                                json={
+                                    "chat_id": CFG.TELEGRAM_CHAT_ID,
+                                    "text": safe_text(
+                                        f"🎯 Signal Found!\n"
+                                        f"Symbol: {symbol}\n"
+                                        f"Side: {candidate['side']}\n"
+                                        f"Zone: {candidate['zone']['kind']}\n"
+                                        f"Score: {candidate['score']:.2f} / {CFG.MIN_SCORING_THRESHOLD}"
+                                    ),
+                                    "disable_web_page_preview": True,
+                                },
+                                timeout=10,
+                            )
+                        except Exception:
+                            pass
 
                     fresh_snapshot = daily_snapshot(
                         broker, state, state_path
@@ -2812,20 +2824,29 @@ def main():
                     atomic_save(state_path, state)
 
                     if CFG.DRY_RUN:
-                        notify(
-                            f"Dry-run signal. Symbol: {symbol}\n"
-                            f"Side: {candidate['side']}\n"
-                            f"Zone: {candidate['zone']['kind']}\n"
-                            f"Confluence: "
-                            f"{candidate['zone']['confluence']}\n"
-                            f"Entry estimate: {request['price']:.8f}\n"
-                            f"Stop: {request['sl']:.8f}\n"
-                            f"Target: {request['tp']:.8f}\n"
-                            f"Volume: {request['volume']:.8f}\n"
-                            f"Estimated risk: {estimated_loss:.2f} "
-                            "account currency\n"
-                            "No trading request was sent."
-                        )
+                        if CFG.TELEGRAM_TOKEN and CFG.TELEGRAM_CHAT_ID:
+                            try:
+                                requests.post(
+                                    f"https://api.telegram.org/bot{CFG.TELEGRAM_TOKEN}/sendMessage",
+                                    json={
+                                        "chat_id": CFG.TELEGRAM_CHAT_ID,
+                                        "text": safe_text(
+                                            f"Dry-run signal. Symbol: {symbol}\n"
+                                            f"Side: {candidate['side']}\n"
+                                            f"Zone: {candidate['zone']['kind']}\n"
+                                            f"Entry estimate: {request['price']:.8f}\n"
+                                            f"Stop: {request['sl']:.8f}\n"
+                                            f"Target: {request['tp']:.8f}\n"
+                                            f"Volume: {request['volume']:.8f}\n"
+                                            f"Estimated risk: {estimated_loss:.2f}\n"
+                                            "No trading request was sent."
+                                        ),
+                                        "disable_web_page_preview": True,
+                                    },
+                                    timeout=10,
+                                )
+                            except Exception:
+                                pass
                         continue
 
                     execute_request(
@@ -2845,12 +2866,25 @@ def main():
                     break
 
                 summary_text = (
-                    f"📊 สรุปผลการสแกนรอบนี้\n"
-                    f"• ตรวจสอบไปทั้งหมด: {scanned_symbols_count} คู่\n"
-                    f"• พบสัญญาณเข้าเทรด: {found_signals_count} คู่\n\n" +
-                    "\n".join(scan_summary_lines[:15])
+                    f"📊 Scan Summary Round\n"
+                    f"• Checked symbols: {scanned_symbols_count}\n"
+                    f"• Signals found: {found_signals_count}\n\n" +
+                    "\n".join(scan_summary_lines[:16])
                 )
-                notify(summary_text)
+                
+                if CFG.TELEGRAM_TOKEN and CFG.TELEGRAM_CHAT_ID:
+                    try:
+                        requests.post(
+                            f"https://api.telegram.org/bot{CFG.TELEGRAM_TOKEN}/sendMessage",
+                            json={
+                                "chat_id": CFG.TELEGRAM_CHAT_ID,
+                                "text": safe_text(summary_text),
+                                "disable_web_page_preview": True,
+                            },
+                            timeout=10,
+                        )
+                    except Exception:
+                        pass
 
                 time.sleep(CFG.POLL_SECONDS)
 
