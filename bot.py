@@ -2878,7 +2878,7 @@ def main():
                     f"📊 Scan Summary Round\n"
                     f"• Checked symbols: {scanned_symbols_count}\n"
                     f"• Signals found: {found_signals_count}\n\n" +
-                    "\n".join(scan_summary_lines[:16])
+                    "\n".join(scan_summary_lines)
                 )
                 
                 if CFG.TELEGRAM_TOKEN and CFG.TELEGRAM_CHAT_ID:
