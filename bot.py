@@ -2684,7 +2684,14 @@ def main():
                     time.sleep(CFG.POLL_SECONDS)
                     continue
 
+                scanned_symbols_count = 0
+                found_signals_count = 0
+                scan_summary_lines = []
+
                 for symbol in CFG.SYMBOLS:
+                    scanned_symbols_count += 1
+                    print(f"--- [SCANNING] กำลังตรวจเช็ก: {symbol} ---", flush=True)
+
                     snapshot = daily_snapshot(
                         broker, state, state_path
                     )
@@ -2696,6 +2703,7 @@ def main():
                     )
 
                     if not permitted:
+                        scan_summary_lines.append(f"• {symbol}: ข้าม ({reason})")
                         status("entry_gate", reason)
                         break
 
@@ -2703,6 +2711,7 @@ def main():
                         item["symbol"] == symbol
                         for item in positions + orders
                     ):
+                        scan_summary_lines.append(f"• {symbol}: ข้าม (มีออร์เดอร์ค้างอยู่)")
                         continue
 
                     news_ok, news_reason = news_permission(
@@ -2710,6 +2719,7 @@ def main():
                     )
 
                     if not news_ok:
+                        scan_summary_lines.append(f"• {symbol}: ข้าม (ติดข่าว)")
                         status(
                             f"news_{symbol}",
                             f"{symbol}: {news_reason}",
@@ -2722,7 +2732,19 @@ def main():
                     )
 
                     if candidate is None:
+                        scan_summary_lines.append(f"• {symbol}: ปกติ (ไม่พบสัญญาณ)")
                         continue
+
+                    found_signals_count += 1
+                    scan_summary_lines.append(f"🔥 {symbol}: พบสัญญาณ! ({candidate['side']} / Score: {candidate['score']:.2f})")
+
+                    notify(
+                        f"🎯 พบสัญญาณเทรด (Signal Found)!\n"
+                        f"Symbol: {symbol}\n"
+                        f"Side: {candidate['side']}\n"
+                        f"Zone: {candidate['zone']['kind']}\n"
+                        f"Score: {candidate['score']:.2f} / {CFG.MIN_SCORING_THRESHOLD}"
+                    )
 
                     fresh_snapshot = daily_snapshot(
                         broker, state, state_path
@@ -2821,6 +2843,14 @@ def main():
                     )
 
                     break
+
+                summary_text = (
+                    f"📊 สรุปผลการสแกนรอบนี้\n"
+                    f"• ตรวจสอบไปทั้งหมด: {scanned_symbols_count} คู่\n"
+                    f"• พบสัญญาณเข้าเทรด: {found_signals_count} คู่\n\n" +
+                    "\n".join(scan_summary_lines[:15])
+                )
+                notify(summary_text)
 
                 time.sleep(CFG.POLL_SECONDS)
 
