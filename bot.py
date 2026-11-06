@@ -116,6 +116,68 @@ def utc_midnight_timestamp():
         hour=0, minute=0, second=0, microsecond=0
     ).timestamp()
 
+def scan_momentum_breakout_candidate(broker, symbol, m5_bars, side, volatility):
+    if len(m5_bars) < 5:
+        return None
+
+    latest = m5_bars[-1]
+    prev = m5_bars[-2]
+    buy = side == "BUY"
+
+    body = abs(latest["close"] - latest["open"])
+    ref_atr = volatility[-1]
+
+    if ref_atr <= 0 or body < ref_atr * 1.2:
+        return None
+
+    if buy and latest["close"] > prev["high"] and latest["close"] > latest["open"]:
+        extreme = min(b["low"] for b in m5_bars[-3:])
+        return {
+            "zone": {"kind": "MOMENTUM_BREAKOUT", "side": "BUY", "bottom": extreme, "top": latest["close"]},
+            "side": "BUY",
+            "extreme": extreme,
+            "atr": ref_atr,
+            "signal_close": latest["close"],
+            "signal_time": int(latest["time"] + 300),
+            "score": 6.5,
+        }
+    elif not buy and latest["close"] < prev["low"] and latest["close"] < latest["open"]:
+        extreme = max(b["high"] for b in m5_bars[-3:])
+        return {
+            "zone": {"kind": "MOMENTUM_BREAKOUT", "side": "SELL", "bottom": latest["close"], "top": extreme},
+            "side": "SELL",
+            "extreme": extreme,
+            "atr": ref_atr,
+            "signal_close": latest["close"],
+            "signal_time": int(latest["time"] + 300),
+            "score": 6.5,
+        }
+
+    return None
+
+def detect_market_regime(h4_bars):
+    if len(h4_bars) < 30:
+        return "RETRACEMENT_SMC"
+
+    closes = [bar["close"] for bar in h4_bars]
+    ema_fast = ema(closes, 50)
+    ema_slow = ema(closes, 200)
+
+    trend_aligned = abs(ema_fast[-1] - ema_slow[-1]) > (ema_slow[-1] * 0.01)
+
+    highs, lows = swings(h4_bars, CFG.HTF_SWING_WINDOW)
+    if len(highs) >= 2 and len(lows) >= 2:
+        recent_range_span = abs(highs[-1]["price"] - lows[-1]["price"])
+        avg_span = sum(h["price"] - l["price"] for h, l in zip(highs[-5:], lows[-5:])) / min(5, len(highs))
+        
+        if trend_aligned and recent_range_span > avg_span * 1.3:
+            return "STRONG_TREND"
+
+    if not trend_aligned:
+        return "RANGING_SIDEWAY"
+
+    return "RETRACEMENT_SMC"
+
 def is_volume_building_up(bars, index, lookback=3):
     if index < lookback:
         return True
@@ -1284,6 +1346,7 @@ def scan_symbol(broker, symbol, state):
         if bar["time"] + 900 <= decision_time
     ]
 
+    regime = detect_market_regime(h4)
     side = htf_bias(h4)
 
     if side == "NEUTRAL" or len(m15) < CFG.DEALING_RANGE_BARS + 10:
@@ -1292,49 +1355,51 @@ def scan_symbol(broker, symbol, state):
     volatility = atr(m5)
     current_price = m5[-1]["close"]
 
-    for zone in create_zones(m15, side):
-        zone_id = f"{symbol}:{zone['local_id']}"
+    candidate = None
 
-        if zone_id in state["seen_zones"]:
-            continue
+    if regime == "STRONG_TREND":
+        candidate = scan_momentum_breakout_candidate(broker, symbol, m5, side, volatility)
+    
+    elif regime == "RANGING_SIDEWAY":
+        candidate = None
+    
+    else:
+        for zone in create_zones(m15, side):
+            zone_id = f"{symbol}:{zone['local_id']}"
 
-        candidate = zone_signal(zone, m5, volatility, pdh, pdl)
+            if zone_id in state["seen_zones"]:
+                continue
 
-        if candidate is None:
-            continue
+            candidate = zone_signal(zone, m5, volatility, pdh, pdl)
+            if candidate is not None:
+                candidate["zone_id"] = zone_id
+                break
 
-        m15_bonus = m15_confirmation(candidate, m15)
+    if candidate is None:
+        return None
 
-        score_boost = m15_bonus
-        is_pd_setup = False
+    m15_bonus = m15_confirmation(candidate, m15)
+    score_boost = m15_bonus
 
-        if pdh is not None and pdl is not None:
-            if candidate["side"] == "SELL":
-                if current_price >= pdh - (volatility[-1] * 1.5):
-                    is_pd_setup = True
-                    score_boost += 2.0
+    if pdh is not None and pdl is not None:
+        if candidate["side"] == "SELL" and current_price >= pdh - (volatility[-1] * 1.5):
+            score_boost += 2.0
+        elif candidate["side"] == "BUY" and current_price <= pdl + (volatility[-1] * 1.5):
+            score_boost += 2.0
 
-            elif candidate["side"] == "BUY":
-                if current_price <= pdl + (volatility[-1] * 1.5):
-                    is_pd_setup = True
-                    score_boost += 2.0
+    if check_trendline_liquidity_sweep(m5, candidate["side"]):
+        score_boost += 1.5
 
-        if check_trendline_liquidity_sweep(m5, candidate["side"]):
-            score_boost += 1.5
+    candidate["score"] = candidate.get("score", 6.0) + score_boost
 
-        candidate["score"] = candidate.get("score", 6.0) + score_boost
+    news_penalty = get_news_score_penalty(symbol)
+    candidate["score"] -= news_penalty
 
-        news_penalty = get_news_score_penalty(symbol)
-        candidate["score"] -= news_penalty
+    if candidate["score"] < CFG.MIN_SCORING_THRESHOLD:
+        return None
 
-        if candidate["score"] < CFG.MIN_SCORING_THRESHOLD:
-            continue
-
-        candidate["symbol"] = symbol
-        candidate["zone_id"] = zone_id
-        return candidate
-
-    return None
+    candidate["symbol"] = symbol
+    return candidate
 
 def floor_volume(volume, step):
     if step <= 0 or volume <= 0:
