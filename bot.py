@@ -174,7 +174,7 @@ def get_dynamic_sweep_atr(symbol, base_atr):
     
     if any(k in symbol_upper for k in ["XAU", "XPT", "XPD", "BTC", "ETH", "SOL", "BNB", "AVAX"]):
         multiplier = 0.12
-    elif any(k in symbol_upper for k in ["30", "TEC", "500", "DE30", "FR40", "UK100", "JP225", "HK50", "AU200", "OIL", "NATGAS", "COPPER"]):
+    elif any(k in symbol_upper for k in ["30", "TEC", "500", "DE30", "FR40", "UK100", "JP225", "HK50", "AU200", "OIL", "XNG", "XCU"]):
         multiplier = 0.20
     elif any(k in symbol_upper for k in ["XRP", "ADA", "DOGE", "LINK", "DOT"]):
         multiplier = 0.15
