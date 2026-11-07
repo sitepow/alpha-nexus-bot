@@ -2765,16 +2765,16 @@ def main():
                 "No automatic news feed is included."
             )
 
+        last_weekend_notify_date = None
+
         while True:
             try:
-               if is_weekend():
+                if is_weekend():
                     current_date = datetime.now(timezone.utc).date()
                     
                     if last_weekend_notify_date != current_date:
                         msg = "Weekend detected. Bot is sleeping to save resources. Resuming on Monday."
-                        
                         notify(msg)
-                        
                         last_weekend_notify_date = current_date
                     
                     time.sleep(3600)
