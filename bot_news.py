@@ -155,7 +155,7 @@ class NewsFetcher:
         out = []
         for item in data:
             impact = item.get("impact")
-            if impact not in CFG.NEWS_IMPACTS_TRACKED:
+            if impact not in CFG.NEWS_IMPACTS_TRACKED and impact != "Medium":
                 continue
                 
             time_str = item.get("date")
@@ -170,6 +170,8 @@ class NewsFetcher:
                     "currency": item.get("country"),
                     "time": news_time,
                     "impact": impact,
+                    "actual": item.get("actual"),
+                    "forecast": item.get("forecast"),
                 })
         return out
 

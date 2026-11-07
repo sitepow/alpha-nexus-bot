@@ -1270,7 +1270,7 @@ def parse_utc_timestamp(value):
     return stamp.astimezone(timezone.utc).timestamp()
 
 
-def get_news_score_penalty(symbol):
+def get_news_sentiment_score(symbol, side):
     if not getattr(CFG, "ENABLE_NEWS_SCORING_PENALTY", False):
         return 0.0
 
@@ -1280,39 +1280,66 @@ def get_news_score_penalty(symbol):
         return 0.0
     clean = clean[:6]
 
-    currencies = {clean[:3], clean[3:6]}
-    related = set()
-    if "USD" in currencies:
-        related.update(["EUR", "GBP", "JPY", "AUD", "NZD", "CAD", "CHF", "XAU", "XAG"])
-    if "EUR" in currencies:
-        related.update(["USD", "GBP", "CHF"])
-    if "GBP" in currencies:
-        related.update(["USD", "EUR"])
-    if "JPY" in currencies:
-        related.update(["USD"])
-    currencies.update(related)
+    base_currency = clean[:3]
+    quote_currency = clean[3:6]
+    
+    relevant_currencies = {base_currency, quote_currency}
+    if "USD" in relevant_currencies or "XAU" in clean or "XAG" in clean:
+        relevant_currencies.update(["USD", "EUR", "GBP", "JPY", "AUD", "CAD"])
 
-    penalty = 0.0
+    sentiment_score = 0.0
 
     with SHARED_NEWS_FETCHER._lock:
         for news in SHARED_NEWS_FETCHER.high_impact_news:
-            if news["currency"] not in currencies:
+            cur = news.get("currency")
+            if cur not in relevant_currencies:
                 continue
             
-            impact_buffer = CFG.NEWS_HIGH_IMPACT_BUFFER_MIN if news["impact"] == "High" else 15
-            diff = (news["time"] - now).total_seconds() / 60
-
-            if -impact_buffer <= diff <= impact_buffer:
-                if news["impact"] == "High":
-                    penalty = max(penalty, CFG.NEWS_HIGH_IMPACT_PENALTY)
+            news_time = news.get("time")
+            if not news_time:
+                continue
+                
+            diff_minutes = (news_time - now).total_seconds() / 60
+            if -30 <= diff_minutes <= 30:
+                impact = news.get("impact", "Medium")
+                actual = news.get("actual")
+                forecast = news.get("forecast")
+                
+                direction_bias = "NEUTRAL"
+                if actual is not None and actual != "" and forecast is not None and forecast != "":
+                    try:
+                        act_val = float(str(actual).replace('%', '').strip())
+                        fore_val = float(str(forecast).replace('%', '').strip())
+                        
+                        if act_val > fore_val:
+                            direction_bias = "BULLISH"
+                        elif act_val < fore_val:
+                            direction_bias = "BEARISH"
+                    except ValueError:
+                        pass
+                
+                is_base = (cur == base_currency or (cur == "USD" and base_currency in ["XAU", "XAG"]))
+                
+                if direction_bias == "BULLISH":
+                    favorable_side = "BUY" if is_base else "SELL"
+                elif direction_bias == "BEARISH":
+                    favorable_side = "SELL" if is_base else "BUY"
                 else:
-                    penalty = max(penalty, CFG.NEWS_MEDIUM_IMPACT_PENALTY)
+                    favorable_side = "NEUTRAL"
 
-    return penalty
+                boost_val = getattr(CFG, "NEWS_SCORE_BOOST_HIGH", 3.0) if impact == "High" else getattr(CFG, "NEWS_SCORE_BOOST_MED", 1.5)
+                penalty_val = CFG.NEWS_HIGH_IMPACT_PENALTY if impact == "High" else CFG.NEWS_MEDIUM_IMPACT_PENALTY
+
+                if favorable_side == side:
+                    sentiment_score += boost_val
+                elif favorable_side != "NEUTRAL" and favorable_side != side:
+                    sentiment_score -= penalty_val
+
+    return sentiment_score
 
 def news_permission(broker, symbol):
     if getattr(CFG, "ENABLE_NEWS_SCORING_PENALTY", False):
-        return True, "News penalty scoring mode active."
+        return True, "News sentiment scoring mode active."
 
     if not CFG.ENABLE_NEWS_FILTER:
         return True, "News filter disabled."
@@ -1397,8 +1424,8 @@ def scan_symbol(broker, symbol, state):
 
     candidate["score"] = candidate.get("score", 6.0) + score_boost
 
-    news_penalty = get_news_score_penalty(symbol)
-    candidate["score"] -= news_penalty
+    news_sentiment = get_news_sentiment_score(symbol, candidate["side"])
+    candidate["score"] += news_sentiment
 
     if candidate["score"] < CFG.MIN_SCORING_THRESHOLD:
         return None
