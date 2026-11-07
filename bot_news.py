@@ -9,7 +9,7 @@ import bot_config as CFG
 
 logging.Formatter.converter = time.gmtime
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.WARNING,
     format="%(asctime)s UTC | %(levelname)s | %(message)s",
 )
 log = logging.getLogger("NewsFetcher")
@@ -105,7 +105,7 @@ class NewsFetcher:
 
         last_error = "all sources failed"
         for src in CFG.NEWS_SOURCES:
-            log.info("Fetching calendar: %s", src)
+            # log.info("Fetching calendar: %s", src)
             try:
                 resp = requests.get(src, headers=headers, timeout=CFG.NEWS_REQUEST_TIMEOUT_SEC)
             except requests.RequestException as e:
