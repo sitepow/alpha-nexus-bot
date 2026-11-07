@@ -225,7 +225,7 @@ VOL_BUILDUP_LOOKBACK = env_int("VOL_BUILDUP_LOOKBACK", 3)
 # 10. PRO TRADING FEATURES
 # ==========================================
 SKIP_IDM_TRAP_ZONES = env_bool("SKIP_IDM_TRAP_ZONES", True)
-MIN_SCORING_THRESHOLD = env_float("MIN_SCORING_THRESHOLD", 3.5)
+MIN_SCORING_THRESHOLD = env_float("MIN_SCORING_THRESHOLD", 5.0)
 
 # ==========================================
 # 11. MITIGATION BLOCK & PRO FEATURES
