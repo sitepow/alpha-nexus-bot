@@ -2763,6 +2763,8 @@ def main():
                     time.sleep(CFG.POLL_SECONDS)
                     continue
 
+                all_candidates = []
+
                 for symbol in CFG.SYMBOLS:
                     print(f"--- [SCANNING] Checking symbol: {symbol} ---", flush=True)
 
@@ -2778,7 +2780,7 @@ def main():
 
                     if not permitted:
                         status("entry_gate", reason)
-                        break
+                        continue
 
                     if any(
                         item["symbol"] == symbol
@@ -2802,135 +2804,110 @@ def main():
                         broker, symbol, state
                     )
 
-                    if candidate is None:
-                        continue
+                    if candidate is not None:
+                        all_candidates.append(candidate)
 
-                    if CFG.TELEGRAM_TOKEN and CFG.TELEGRAM_CHAT_ID:
-                        try:
-                            requests.post(
-                                f"https://api.telegram.org/bot{CFG.TELEGRAM_TOKEN}/sendMessage",
-                                json={
-                                    "chat_id": CFG.TELEGRAM_CHAT_ID,
-                                    "text": safe_text(
-                                        f"🎯 Signal Found!\n"
-                                        f"Symbol: {symbol}\n"
-                                        f"Side: {candidate['side']}\n"
-                                        f"Zone: {candidate['zone']['kind']}\n"
-                                        f"Score: {candidate['score']:.2f} / {CFG.MIN_SCORING_THRESHOLD}"
-                                    ),
-                                    "disable_web_page_preview": True,
-                                },
-                                timeout=10,
-                            )
-                        except Exception:
-                            pass
+                if all_candidates:
+                    all_candidates.sort(key=lambda x: x["score"], reverse=True)
 
-                    fresh_snapshot = daily_snapshot(
-                        broker, state, state_path
-                    )
-                    fresh_positions = broker.positions()
-                    fresh_orders = broker.orders()
+                    top_signal_text = "Top Ranked Signals:\n"
+                    for c in all_candidates[:5]:
+                        top_signal_text += f"- {c['symbol']} ({c['side']}) [{c['zone']['kind']}] | Score: {c['score']:.2f}\n"
+                    notify(top_signal_text)
 
-                    permitted, reason = entry_permission(
-                        broker,
-                        state,
-                        fresh_snapshot,
-                        fresh_positions,
-                        fresh_orders,
-                    )
+                    for candidate in all_candidates:
+                        symbol = candidate["symbol"]
 
-                    if not permitted:
-                        break
+                        fresh_snapshot = daily_snapshot(broker, state, state_path)
+                        fresh_positions = broker.positions()
+                        fresh_orders = broker.orders()
 
-                    if any(
-                        item["symbol"] == symbol
-                        for item in fresh_positions + fresh_orders
-                    ):
-                        continue
-
-                    built = build_order(
-                        broker,
-                        candidate,
-                        fresh_snapshot["account"],
-                    )
-
-                    if built is None:
-                        continue
-
-                    request, estimated_loss = built
-
-                    final_positions = broker.positions()
-                    final_orders = broker.orders()
-
-                    permitted, reason = entry_permission(
-                        broker,
-                        state,
-                        fresh_snapshot,
-                        final_positions,
-                        final_orders,
-                    )
-
-                    if not permitted:
-                        break
-
-                    if any(
-                        item["symbol"] == symbol
-                        for item in final_positions + final_orders
-                    ):
-                        continue
-
-                    state["seen_zones"][
-                        candidate["zone_id"]
-                    ] = time.time()
-
-                    if CFG.DRY_RUN:
-                        state["dry_run_entries"] = (
-                            int(state.get("dry_run_entries", 0)) + 1
+                        permitted, reason = entry_permission(
+                            broker,
+                            state,
+                            fresh_snapshot,
+                            fresh_positions,
+                            fresh_orders,
                         )
 
-                    atomic_save(state_path, state)
+                        if not permitted:
+                            break
 
-                    if CFG.DRY_RUN:
-                        if CFG.TELEGRAM_TOKEN and CFG.TELEGRAM_CHAT_ID:
-                            try:
-                                requests.post(
-                                    f"https://api.telegram.org/bot{CFG.TELEGRAM_TOKEN}/sendMessage",
-                                    json={
-                                        "chat_id": CFG.TELEGRAM_CHAT_ID,
-                                        "text": safe_text(
-                                            f"Dry-run signal. Symbol: {symbol}\n"
-                                            f"Side: {candidate['side']}\n"
-                                            f"Zone: {candidate['zone']['kind']}\n"
-                                            f"Entry estimate: {request['price']:.8f}\n"
-                                            f"Stop: {request['sl']:.8f}\n"
-                                            f"Target: {request['tp']:.8f}\n"
-                                            f"Volume: {request['volume']:.8f}\n"
-                                            f"Estimated risk: {estimated_loss:.2f}\n"
-                                            "No trading request was sent."
-                                        ),
-                                        "disable_web_page_preview": True,
-                                    },
-                                    timeout=10,
-                                )
-                            except Exception:
-                                pass
-                        continue
+                        if any(
+                            item["symbol"] == symbol
+                            for item in fresh_positions + fresh_orders
+                        ):
+                            continue
 
-                    execute_request(
-                        broker,
-                        state,
-                        state_path,
-                        "ENTRY",
-                        request,
-                        {
-                            "side": candidate["side"],
-                            "zone_id": candidate["zone_id"],
-                            "estimated_loss": estimated_loss,
-                            "signal_time": candidate["signal_time"],
-                        },
-                    )
+                        bot_positions = [
+                            p for p in fresh_positions 
+                            if int(p.get("magic", 0)) == CFG.MAGIC
+                        ]
+                        if len(bot_positions) >= CFG.MAX_OPEN_POSITIONS:
+                            break
 
-                    break
+                        built = build_order(
+                            broker,
+                            candidate,
+                            fresh_snapshot["account"],
+                        )
+
+                        if built is None:
+                            continue
+
+                        request, estimated_loss = built
+
+                        state["seen_zones"][
+                            candidate["zone_id"]
+                        ] = time.time()
+
+                        if CFG.DRY_RUN:
+                            state["dry_run_entries"] = (
+                                int(state.get("dry_run_entries", 0)) + 1
+                            )
+
+                        atomic_save(state_path, state)
+
+                        if CFG.DRY_RUN:
+                            if CFG.TELEGRAM_TOKEN and CFG.TELEGRAM_CHAT_ID:
+                                try:
+                                    requests.post(
+                                        f"https://api.telegram.org/bot{CFG.TELEGRAM_TOKEN}/sendMessage",
+                                        json={
+                                            "chat_id": CFG.TELEGRAM_CHAT_ID,
+                                            "text": safe_text(
+                                                f"Dry-run signal (Ranked). Symbol: {symbol}\n"
+                                                f"Side: {candidate['side']}\n"
+                                                f"Zone: {candidate['zone']['kind']}\n"
+                                                f"Score: {candidate['score']:.2f}\n"
+                                                f"Entry estimate: {request['price']:.8f}\n"
+                                                f"Stop: {request['sl']:.8f}\n"
+                                                f"Target: {request['tp']:.8f}\n"
+                                                f"Volume: {request['volume']:.8f}\n"
+                                                f"Estimated risk: {estimated_loss:.2f}\n"
+                                                "No trading request was sent."
+                                            ),
+                                            "disable_web_page_preview": True,
+                                        },
+                                        timeout=10,
+                                    )
+                                except Exception:
+                                    pass
+                            continue
+
+                        execute_request(
+                            broker,
+                            state,
+                            state_path,
+                            "ENTRY",
+                            request,
+                            {
+                                "side": candidate["side"],
+                                "zone_id": candidate["zone_id"],
+                                "estimated_loss": estimated_loss,
+                                "signal_time": candidate["signal_time"],
+                            },
+                        )
 
                 time.sleep(CFG.POLL_SECONDS)
 
