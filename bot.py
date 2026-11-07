@@ -130,6 +130,8 @@ def scan_momentum_breakout_candidate(broker, symbol, m5_bars, side, volatility):
     if ref_atr <= 0 or body < ref_atr * 1.2:
         return None
 
+    zone_key = f"{symbol}:MOMENTUM_BREAKOUT:{side}:{latest['time']}"
+
     if buy and latest["close"] > prev["high"] and latest["close"] > latest["open"]:
         extreme = min(b["low"] for b in m5_bars[-3:])
         return {
@@ -140,6 +142,7 @@ def scan_momentum_breakout_candidate(broker, symbol, m5_bars, side, volatility):
             "signal_close": latest["close"],
             "signal_time": int(latest["time"] + 300),
             "score": 6.5,
+            "zone_id": zone_key,
         }
     elif not buy and latest["close"] < prev["low"] and latest["close"] < latest["open"]:
         extreme = max(b["high"] for b in m5_bars[-3:])
@@ -151,6 +154,7 @@ def scan_momentum_breakout_candidate(broker, symbol, m5_bars, side, volatility):
             "signal_close": latest["close"],
             "signal_time": int(latest["time"] + 300),
             "score": 6.5,
+            "zone_id": zone_key,
         }
 
     return None
@@ -978,7 +982,7 @@ def calculate_scoring_logic(bars, zone, sweep_bar, confirmation_bar, reference_a
     score += 1.5
     return min(score, 10.0)
 
-def create_zones(bars, side):
+def create_zones(symbol, bars, side):
     volatility = atr(bars)
     buy = side == "BUY"
     result = []
@@ -1053,6 +1057,7 @@ def create_zones(bars, side):
             result.append({
                 "kind": kind,
                 "side": side,
+                "symbol": symbol,
                 "bottom": float(bottom),
                 "top": float(top),
                 "created": created,
@@ -1364,7 +1369,7 @@ def scan_symbol(broker, symbol, state):
         candidate = None
     
     else:
-        for zone in create_zones(m15, side):
+        for zone in create_zones(symbol, m15, side):
             zone_id = f"{symbol}:{zone['local_id']}"
 
             if zone_id in state["seen_zones"]:
