@@ -63,6 +63,10 @@ try:
 except ImportError:
     fcntl = None
 
+def is_weekend():
+    current_utc_time = datetime.now(timezone.utc)
+    return current_utc_time.weekday() >= 5
+
 class TelegramLogHandler(logging.Handler):
     def emit(self, record):
         try:
@@ -2763,8 +2767,20 @@ def main():
 
         while True:
             try:
+               if is_weekend():
+                    current_date = datetime.now(timezone.utc).date()
+                    
+                    if last_weekend_notify_date != current_date:
+                        msg = "Weekend detected. Bot is sleeping to save resources. Resuming on Monday."
+                        
+                        notify(msg)
+                        
+                        last_weekend_notify_date = current_date
+                    
+                    time.sleep(3600)
+                    continue
+                
                 validate_account(broker, account_key)
-
                 resolve_pending(broker, state, state_path)
                 reconcile_positions(broker, state, state_path)
 
