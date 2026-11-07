@@ -121,7 +121,7 @@ def utc_midnight_timestamp():
     ).timestamp()
 
 def scan_momentum_breakout_candidate(broker, symbol, m5_bars, side, volatility):
-    if len(m5_bars) < 5:
+    if len(m5_bars) < max(5, CFG.VOLUME_MA_PERIOD):
         return None
 
     latest = m5_bars[-1]
@@ -136,8 +136,45 @@ def scan_momentum_breakout_candidate(broker, symbol, m5_bars, side, volatility):
 
     zone_key = f"{symbol}:MOMENTUM_BREAKOUT:{side}:{latest['time']}"
 
+    is_breakout = False
     if buy and latest["close"] > prev["high"] and latest["close"] > latest["open"]:
+        is_breakout = True
         extreme = min(b["low"] for b in m5_bars[-3:])
+    elif not buy and latest["close"] < prev["low"] and latest["close"] < latest["open"]:
+        is_breakout = True
+        extreme = max(b["high"] for b in m5_bars[-3:])
+
+    if not is_breakout:
+        return None
+
+    score = 5.0
+
+    if body >= ref_atr * 1.8:
+        score += 2.0
+    elif body >= ref_atr * 1.4:
+        score += 1.2
+    elif body >= ref_atr * 1.2:
+        score += 0.5
+
+    vol_ma = volume_ma(m5_bars, CFG.VOLUME_MA_PERIOD)
+    if vol_ma and len(vol_ma) > 0:
+        avg_vol = vol_ma[-1]
+        if avg_vol > 0:
+            vol_ratio = latest["volume"] / avg_vol
+            threshold_mult = getattr(CFG, "DISPLACEMENT_VOLUME_MULTIPLIER", 1.5)
+            if vol_ratio >= threshold_mult:
+                score += 3.0
+            elif vol_ratio >= 1.2:
+                score += 1.5
+
+    if buy and latest["close"] > latest["open"]:
+        score += 0.5
+    elif not buy and latest["close"] < latest["open"]:
+        score += 0.5
+
+    final_score = min(score, 10.0)
+
+    if buy:
         return {
             "zone": {"kind": "MOMENTUM_BREAKOUT", "side": "BUY", "bottom": extreme, "top": latest["close"]},
             "side": "BUY",
@@ -145,11 +182,10 @@ def scan_momentum_breakout_candidate(broker, symbol, m5_bars, side, volatility):
             "atr": ref_atr,
             "signal_close": latest["close"],
             "signal_time": int(latest["time"] + 300),
-            "score": 6.5,
+            "score": final_score,
             "zone_id": zone_key,
         }
-    elif not buy and latest["close"] < prev["low"] and latest["close"] < latest["open"]:
-        extreme = max(b["high"] for b in m5_bars[-3:])
+    else:
         return {
             "zone": {"kind": "MOMENTUM_BREAKOUT", "side": "SELL", "bottom": latest["close"], "top": extreme},
             "side": "SELL",
@@ -157,11 +193,9 @@ def scan_momentum_breakout_candidate(broker, symbol, m5_bars, side, volatility):
             "atr": ref_atr,
             "signal_close": latest["close"],
             "signal_time": int(latest["time"] + 300),
-            "score": 6.5,
+            "score": final_score,
             "zone_id": zone_key,
         }
-
-    return None
 
 def detect_market_regime(h4_bars):
     if len(h4_bars) < 30:
