@@ -120,6 +120,38 @@ def utc_midnight_timestamp():
         hour=0, minute=0, second=0, microsecond=0
     ).timestamp()
 
+def analyze_order_flow(broker, symbol, side, reference_bar):
+    if not getattr(CFG, "ENABLE_ORDER_FLOW_SCORING", True):
+        return 0.0
+
+    flow_score = 0.0
+    buy = (side == "BUY")
+
+    try:
+        book = broker.read(f"mt5.market_book_get({symbol!r})")
+        if book and isinstance(book, list) and len(book) > 0:
+            bid_volume_total = sum(float(item.get("volume", 0)) for item in book if item.get("type") == 1) # BID
+            ask_volume_total = sum(float(item.get("volume", 0)) for item in book if item.get("type") == 2) # ASK
+            
+            if buy and bid_volume_total > ask_volume_total * 1.3:
+                flow_score += 1.5
+            elif not buy and ask_volume_total > bid_volume_total * 1.3:
+                flow_score += 1.5
+    except Exception:
+        pass
+
+    try:
+        bar_volume = float(reference_bar.get("volume", 0))
+        vol_ma_list = volume_ma([reference_bar], CFG.VOLUME_MA_PERIOD)
+        if vol_ma_list and len(vol_ma_list) > 0:
+            avg_vol = vol_ma_list[-1]
+            if avg_vol > 0 and bar_volume >= avg_vol * CFG.TICK_VOLUME_SURGE_MULTIPLIER:
+                flow_score += 1.5
+    except Exception:
+        pass
+
+    return min(flow_score, CFG.ORDER_FLOW_SCORE_BOOST)
+
 def scan_momentum_breakout_candidate(broker, symbol, m5_bars, side, volatility):
     if len(m5_bars) < max(5, CFG.VOLUME_MA_PERIOD):
         return None
@@ -976,7 +1008,7 @@ def check_harmonic_bat_pattern(bars, side):
 
         return valid_b and valid_c and valid_d
 
-def calculate_scoring_logic(bars, zone, sweep_bar, confirmation_bar, reference_atr, pdh=None, pdl=None):
+def calculate_scoring_logic(broker, bars, zone, sweep_bar, confirmation_bar, reference_atr, pdh=None, pdl=None):
     score = 0.0
     
     if zone.get("is_mitigation", False):
@@ -1016,6 +1048,10 @@ def calculate_scoring_logic(bars, zone, sweep_bar, confirmation_bar, reference_a
     if getattr(CFG, "ENABLE_HARMONIC_BAT", True):
         if check_harmonic_bat_pattern(bars, zone["side"]):
             score += getattr(CFG, "HARMONIC_SCORE_BOOST", 2.0)
+
+    symbol = zone.get("symbol", "EURUSD")
+    order_flow_points = analyze_order_flow(broker, symbol, zone["side"], confirmation_bar)
+    score += order_flow_points
 
     score += 1.5
     return min(score, 10.0)
