@@ -1465,6 +1465,12 @@ def scan_symbol(broker, symbol, state):
 
     if regime == "STRONG_TREND":
         candidate = scan_momentum_breakout_candidate(broker, symbol, m5, side, volatility)
+        
+        if candidate is not None:
+            if side == "BUY" and candidate["side"] == "SELL":
+                return None
+            elif side == "SELL" and candidate["side"] == "BUY":
+                return None
     
     elif regime == "RANGING_SIDEWAY":
         candidate = None
@@ -2918,7 +2924,9 @@ def main():
                     )
 
                     if candidate is not None:
-                        all_candidates.append(candidate)
+                        zone_id = candidate["zone_id"]
+                        if zone_id not in state["seen_zones"]:
+                            all_candidates.append(candidate)
 
                 if all_candidates:
                     all_candidates.sort(key=lambda x: x["score"], reverse=True)
@@ -2930,6 +2938,10 @@ def main():
 
                     for candidate in all_candidates:
                         symbol = candidate["symbol"]
+                        zone_id = candidate["zone_id"]
+
+                        if zone_id in state["seen_zones"]:
+                            continue
 
                         fresh_snapshot = daily_snapshot(broker, state, state_path)
                         fresh_positions = broker.positions()
@@ -2970,9 +2982,7 @@ def main():
 
                         request, estimated_loss = built
 
-                        state["seen_zones"][
-                            candidate["zone_id"]
-                        ] = time.time()
+                        state["seen_zones"][zone_id] = time.time()
 
                         if CFG.DRY_RUN:
                             state["dry_run_entries"] = (
