@@ -120,7 +120,7 @@ def utc_midnight_timestamp():
         hour=0, minute=0, second=0, microsecond=0
     ).timestamp()
 
-def analyze_order_flow(broker, symbol, side, reference_bar):
+def analyze_order_flow(broker, symbol, side, reference_bar, bars=None):
     if not getattr(CFG, "ENABLE_ORDER_FLOW_SCORING", True):
         return 0.0
 
@@ -130,9 +130,9 @@ def analyze_order_flow(broker, symbol, side, reference_bar):
     try:
         book = broker.read(f"mt5.market_book_get({symbol!r})")
         if book and isinstance(book, list) and len(book) > 0:
-            bid_volume_total = sum(float(item.get("volume", 0)) for item in book if item.get("type") == 1) # BID
-            ask_volume_total = sum(float(item.get("volume", 0)) for item in book if item.get("type") == 2) # ASK
-            
+            bid_volume_total = sum(float(item.get("volume", 0)) for item in book if item.get("type") == 1)
+            ask_volume_total = sum(float(item.get("volume", 0)) for item in book if item.get("type") == 2)
+
             if buy and bid_volume_total > ask_volume_total * 1.3:
                 flow_score += 1.5
             elif not buy and ask_volume_total > bid_volume_total * 1.3:
@@ -141,12 +141,15 @@ def analyze_order_flow(broker, symbol, side, reference_bar):
         pass
 
     try:
-        bar_volume = float(reference_bar.get("volume", 0))
-        vol_ma_list = volume_ma([reference_bar], CFG.VOLUME_MA_PERIOD)
-        if vol_ma_list and len(vol_ma_list) > 0:
-            avg_vol = vol_ma_list[-1]
-            if avg_vol > 0 and bar_volume >= avg_vol * CFG.TICK_VOLUME_SURGE_MULTIPLIER:
-                flow_score += 1.5
+        if bars is None or len(bars) < 2:
+            pass
+        else:
+            bar_volume = float(reference_bar.get("volume", 0))
+            vol_ma_list = volume_ma(bars, CFG.VOLUME_MA_PERIOD)
+            if vol_ma_list:
+                avg_vol = vol_ma_list[-1]
+                if avg_vol > 0 and bar_volume >= avg_vol * CFG.TICK_VOLUME_SURGE_MULTIPLIER:
+                    flow_score += 1.5
     except Exception:
         pass
 
@@ -169,17 +172,28 @@ def scan_momentum_breakout_candidate(broker, symbol, m5_bars, side, volatility):
     zone_key = f"{symbol}:MOMENTUM_BREAKOUT:{side}:{latest['time']}"
 
     is_breakout = False
+    extreme = None
+
     if buy and latest["close"] > prev["high"] and latest["close"] > latest["open"]:
         is_breakout = True
-        extreme = min(b["low"] for b in m5_bars[-3:])
+        extreme = min(b["low"] for b in m5_bars[-3:-1])
     elif not buy and latest["close"] < prev["low"] and latest["close"] < latest["open"]:
         is_breakout = True
-        extreme = max(b["high"] for b in m5_bars[-3:])
+        extreme = max(b["high"] for b in m5_bars[-3:-1])
 
-    if not is_breakout:
+    if not is_breakout or extreme is None:
         return None
 
-    score = 5.0
+    max_wick_ratio = getattr(CFG, "MAX_SWEEP_WICK_RATIO", 0.70)
+    if not wick_rejection_ok(latest, side, max_wick_ratio):
+        return None
+
+    if not has_consolidation_before_breakout(m5_bars, len(m5_bars) - 1):
+        return None
+
+    score = 4.0
+    has_volume_boost = False
+    has_sweep_boost = False
 
     if body >= ref_atr * 1.8:
         score += 2.0
@@ -188,46 +202,49 @@ def scan_momentum_breakout_candidate(broker, symbol, m5_bars, side, volatility):
     elif body >= ref_atr * 1.2:
         score += 0.5
 
-    vol_ma = volume_ma(m5_bars, CFG.VOLUME_MA_PERIOD)
-    if vol_ma and len(vol_ma) > 0:
+    vol_ma = volume_ma(m5_bars[:-1], CFG.VOLUME_MA_PERIOD)
+    if vol_ma:
         avg_vol = vol_ma[-1]
         if avg_vol > 0:
             vol_ratio = latest["volume"] / avg_vol
             threshold_mult = getattr(CFG, "DISPLACEMENT_VOLUME_MULTIPLIER", 1.5)
             if vol_ratio >= threshold_mult:
                 score += 3.0
+                has_volume_boost = True
             elif vol_ratio >= 1.2:
                 score += 1.5
+                has_volume_boost = True
 
-    if buy and latest["close"] > latest["open"]:
+    if (buy and latest["close"] > latest["open"]) or (not buy and latest["close"] < latest["open"]):
         score += 0.5
-    elif not buy and latest["close"] < latest["open"]:
-        score += 0.5
+
+    try:
+        if check_trendline_liquidity_sweep(m5_bars, side):
+            score += 1.5
+            has_sweep_boost = True
+    except Exception:
+        pass
+
+    if not has_volume_boost and not has_sweep_boost:
+        return None
 
     final_score = min(score, 10.0)
 
     if buy:
-        return {
-            "zone": {"kind": "MOMENTUM_BREAKOUT", "side": "BUY", "bottom": extreme, "top": latest["close"]},
-            "side": "BUY",
-            "extreme": extreme,
-            "atr": ref_atr,
-            "signal_close": latest["close"],
-            "signal_time": int(latest["time"] + 300),
-            "score": final_score,
-            "zone_id": zone_key,
-        }
+        zone = {"kind": "MOMENTUM_BREAKOUT", "side": "BUY", "bottom": extreme, "top": latest["close"]}
     else:
-        return {
-            "zone": {"kind": "MOMENTUM_BREAKOUT", "side": "SELL", "bottom": latest["close"], "top": extreme},
-            "side": "SELL",
-            "extreme": extreme,
-            "atr": ref_atr,
-            "signal_close": latest["close"],
-            "signal_time": int(latest["time"] + 300),
-            "score": final_score,
-            "zone_id": zone_key,
-        }
+        zone = {"kind": "MOMENTUM_BREAKOUT", "side": "SELL", "bottom": latest["close"], "top": extreme}
+
+    return {
+        "zone": zone,
+        "side": side,
+        "extreme": extreme,
+        "atr": ref_atr,
+        "signal_close": latest["close"],
+        "signal_time": int(latest["time"] + 300),
+        "score": final_score,
+        "zone_id": zone_key,
+    }
 
 def detect_market_regime(h4_bars):
     if len(h4_bars) < 30:
@@ -1010,10 +1027,10 @@ def check_harmonic_bat_pattern(bars, side):
 
 def calculate_scoring_logic(broker, bars, zone, sweep_bar, confirmation_bar, reference_atr, pdh=None, pdl=None):
     score = 0.0
-    
+
     if zone.get("is_mitigation", False):
         score += getattr(CFG, "MITIGATION_SCORE_BOOST", 2.0)
-    
+
     if zone.get("confluence", False):
         score += 3.0
     else:
@@ -1023,8 +1040,8 @@ def calculate_scoring_logic(broker, bars, zone, sweep_bar, confirmation_bar, ref
     if bar_range > 0:
         buy = zone["side"] == "BUY"
         wick_ratio = (
-            (sweep_bar["high"] - sweep_bar["close"]) / bar_range 
-            if buy 
+            (sweep_bar["high"] - sweep_bar["close"]) / bar_range
+            if buy
             else (sweep_bar["close"] - sweep_bar["low"]) / bar_range
         )
         if wick_ratio >= 0.40:
@@ -1050,7 +1067,8 @@ def calculate_scoring_logic(broker, bars, zone, sweep_bar, confirmation_bar, ref
             score += getattr(CFG, "HARMONIC_SCORE_BOOST", 2.0)
 
     symbol = zone.get("symbol", "EURUSD")
-    order_flow_points = analyze_order_flow(broker, symbol, zone["side"], confirmation_bar)
+    flow_bars = bars[:conf_idx] if conf_idx > 0 else None
+    order_flow_points = analyze_order_flow(broker, symbol, zone["side"], confirmation_bar, flow_bars)
     score += order_flow_points
 
     score += 1.5
@@ -1163,7 +1181,7 @@ def create_zones(symbol, bars, side):
     unique = {zone["local_id"]: zone for zone in result}
     return sorted(unique.values(), key=lambda zone: zone["created"], reverse=True)
 
-def zone_signal(zone, bars, volatility, pdh=None, pdl=None):
+def zone_signal(zone, bars, volatility, pdh=None, pdl=None, broker=None):
     if not bars or bars[0]["time"] > zone["created"]:
         return None
 
@@ -1291,7 +1309,7 @@ def zone_signal(zone, bars, volatility, pdh=None, pdl=None):
             if body < CFG.CONFIRM_MIN_BODY_ATR * reference:
                 signal_score_modifier -= 1.0
 
-            score = calculate_scoring_logic(bars, zone, sweep_bar, bar, reference, pdh, pdl)
+            score = calculate_scoring_logic(broker, bars, zone, sweep_bar, bar, reference, pdh, pdl)
             final_score = score + signal_score_modifier
 
             if final_score < CFG.MIN_SCORING_THRESHOLD:
@@ -1443,14 +1461,8 @@ def scan_symbol(broker, symbol, state):
 
     pdh, pdl = calculate_pdh_pdl(broker, symbol)
 
-    h4 = [
-        bar for bar in h4
-        if bar["time"] + 14400 <= decision_time
-    ]
-    m15 = [
-        bar for bar in m15
-        if bar["time"] + 900 <= decision_time
-    ]
+    h4 = [bar for bar in h4 if bar["time"] + 14400 <= decision_time]
+    m15 = [bar for bar in m15 if bar["time"] + 900 <= decision_time]
 
     regime = detect_market_regime(h4)
     side = htf_bias(h4)
@@ -1461,57 +1473,74 @@ def scan_symbol(broker, symbol, state):
     volatility = atr(m5)
     current_price = m5[-1]["close"]
 
-    candidate = None
+    candidates = []
 
-    if regime == "STRONG_TREND":
-        candidate = scan_momentum_breakout_candidate(broker, symbol, m5, side, volatility)
-        
-        if candidate is not None:
-            if side == "BUY" and candidate["side"] == "SELL":
-                return None
-            elif side == "SELL" and candidate["side"] == "BUY":
-                return None
-    
-    elif regime == "RANGING_SIDEWAY":
-        candidate = None
-    
-    else:
+    if regime in ("STRONG_TREND", "RETRACEMENT_SMC"):
+        mom = scan_momentum_breakout_candidate(broker, symbol, m5, side, volatility)
+        if mom is not None and mom["side"] == side:
+            if regime == "RETRACEMENT_SMC":
+                mom["score"] = max(0.0, mom["score"] - 1.0)
+            candidates.append(("momentum", mom))
+
+    if regime != "RANGING_SIDEWAY":
         for zone in create_zones(symbol, m15, side):
             zone_id = f"{symbol}:{zone['local_id']}"
 
             if zone_id in state["seen_zones"]:
                 continue
 
-            candidate = zone_signal(zone, m5, volatility, pdh, pdl)
-            if candidate is not None:
-                candidate["zone_id"] = zone_id
-                break
+            sig = zone_signal(zone, m5, volatility, pdh, pdl, broker=broker)
+            if sig is not None:
+                sig["zone_id"] = zone_id
+                candidates.append(("smc", sig))
+                if len(candidates) >= 6:
+                    break
 
-    if candidate is None:
+    if not candidates:
         return None
 
-    m15_bonus = m15_confirmation(candidate, m15)
-    score_boost = m15_bonus
+    for kind, candidate in candidates:
+        m15_bonus = m15_confirmation(candidate, m15)
+        score_boost = m15_bonus
 
-    if pdh is not None and pdl is not None:
-        if candidate["side"] == "SELL" and current_price >= pdh - (volatility[-1] * 1.5):
-            score_boost += 2.0
-        elif candidate["side"] == "BUY" and current_price <= pdl + (volatility[-1] * 1.5):
-            score_boost += 2.0
+        if pdh is not None and pdl is not None:
+            if candidate["side"] == "SELL" and current_price >= pdh - (volatility[-1] * 1.5):
+                score_boost += 2.0
+            elif candidate["side"] == "BUY" and current_price <= pdl + (volatility[-1] * 1.5):
+                score_boost += 2.0
 
-    if check_trendline_liquidity_sweep(m5, candidate["side"]):
-        score_boost += 1.5
+        if kind == "smc":
+            try:
+                if check_trendline_liquidity_sweep(m5, candidate["side"]):
+                    score_boost += 1.5
+            except Exception:
+                pass
 
-    candidate["score"] = candidate.get("score", 6.0) + score_boost
+        candidate["score"] = candidate.get("score", 6.0) + score_boost
 
-    news_sentiment = get_news_sentiment_score(symbol, candidate["side"])
-    candidate["score"] += news_sentiment
+        news_sentiment = get_news_sentiment_score(symbol, candidate["side"])
+        candidate["score"] += news_sentiment
 
-    if candidate["score"] < CFG.MIN_SCORING_THRESHOLD:
+    eligible = [(k, c) for (k, c) in candidates if c["score"] >= CFG.MIN_SCORING_THRESHOLD]
+    if not eligible:
         return None
 
-    candidate["symbol"] = symbol
-    return candidate
+    mom_pool = [c for (k, c) in eligible if k == "momentum"]
+    smc_pool = [c for (k, c) in eligible if k == "smc"]
+
+    best_mom = max(mom_pool, key=lambda c: c["score"]) if mom_pool else None
+    best_smc = max(smc_pool, key=lambda c: c["score"]) if smc_pool else None
+
+    if best_mom is not None and best_smc is not None:
+        if best_mom["score"] >= best_smc["score"] - 0.5:
+            chosen = best_mom
+        else:
+            chosen = best_smc
+    else:
+        chosen = best_mom if best_mom is not None else best_smc
+
+    chosen["symbol"] = symbol
+    return chosen
 
 def floor_volume(volume, step):
     if step <= 0 or volume <= 0:
@@ -2784,6 +2813,38 @@ def validate_account(broker, expected_key):
             raise SafetyError("Account financial data is invalid.")
 
     return account
+
+
+def has_consolidation_before_breakout(bars, breakout_idx, lookback=8, atr_ratio_threshold=0.7):
+    """True if ATR was compressed before the breakout bar (conservative default True)."""
+    if breakout_idx < lookback + 2:
+        return True
+
+    atr_series = atr(bars[:breakout_idx + 1])
+    if len(atr_series) < 20 + lookback:
+        return True
+
+    recent_atr = atr_series[breakout_idx]
+    base_atr = sum(atr_series[breakout_idx - lookback:breakout_idx]) / lookback
+
+    if recent_atr <= 0 or base_atr <= 0:
+        return True
+
+    return base_atr <= recent_atr * atr_ratio_threshold
+
+def wick_rejection_ok(bar, side, max_wick_ratio):
+    """True if the counter-direction wick is within the allowed ratio."""
+    bar_range = bar["high"] - bar["low"]
+    if bar_range <= 0:
+        return False
+
+    if side == "BUY":
+        wick = bar["high"] - max(bar["open"], bar["close"])
+    else:
+        wick = min(bar["open"], bar["close"]) - bar["low"]
+
+    return (wick / bar_range) <= max_wick_ratio
+
 
 
 def main():
