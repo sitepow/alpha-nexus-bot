@@ -1557,10 +1557,10 @@ def spread_points(tick, info):
 def choose_filling(broker, info):
     flags = int(info.get("filling_mode", 0))
 
-    if flags & broker.constant("SYMBOL_FILLING_FOK"):
+    if flags & 1:
         return broker.constant("ORDER_FILLING_FOK")
 
-    if flags & broker.constant("SYMBOL_FILLING_IOC"):
+    if flags & 2:
         return broker.constant("ORDER_FILLING_IOC")
 
     execution = int(info.get("trade_exemode", -1))
