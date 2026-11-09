@@ -296,29 +296,6 @@ def notify(message):
     message = safe_text(message)
     log(message)
 
-    if not CFG.TELEGRAM_TOKEN or not CFG.TELEGRAM_CHAT_ID:
-        return
-
-    try:
-        response = requests.post(
-            f"https://api.telegram.org/bot{CFG.TELEGRAM_TOKEN}/sendMessage",
-            json={
-                "chat_id": CFG.TELEGRAM_CHAT_ID,
-                "text": message,
-                "disable_web_page_preview": True,
-            },
-            timeout=10,
-        )
-        if response.status_code != 200:
-            log("Telegram delivery failed.")
-            return
-
-        if not response.json().get("ok", False):
-            log("Telegram delivery was rejected.")
-
-    except Exception:
-        log("Telegram delivery failed.")
-
 def get_dynamic_sweep_atr(symbol, base_atr):
     if not symbol:
         return base_atr * 0.10
@@ -1618,12 +1595,15 @@ def stop_gap(info, include_freeze=False):
 def build_order(broker, candidate, account):
     symbol = candidate["symbol"]
     buy = candidate["side"] == "BUY"
+    tag = f"{symbol} {candidate['side']} [{candidate['zone']['kind']}]"
+
+    def reject(reason):
+        status(f"reject_{symbol}", f"[REJECT] {tag}\nReason: {reason}", 60)
+        return None
 
     allowed, reason = news_permission(broker, symbol)
-
     if not allowed:
-        status(f"news_{symbol}", f"{symbol}: {reason}", 60)
-        return None
+        return reject(f"News restriction ({reason})")
 
     info = broker.info(symbol)
     tick = broker.tick(symbol)
@@ -1632,43 +1612,30 @@ def build_order(broker, candidate, account):
         return None
 
     signal_age = time.time() - candidate["signal_time"]
-
-    if (
-        signal_age < 0
-        or signal_age > CFG.MAX_CLOSED_M5_AGE_SECONDS
-    ):
-        return None
+    if signal_age < 0 or signal_age > CFG.MAX_CLOSED_M5_AGE_SECONDS:
+        return reject(f"Signal expired (Age: {signal_age:.1f}s, Max: {CFG.MAX_CLOSED_M5_AGE_SECONDS}s)")
 
     allowed_modes = {
         broker.constant("SYMBOL_TRADE_MODE_FULL"),
-        broker.constant(
-            "SYMBOL_TRADE_MODE_LONGONLY"
-            if buy
-            else "SYMBOL_TRADE_MODE_SHORTONLY"
-        ),
+        broker.constant("SYMBOL_TRADE_MODE_LONGONLY" if buy else "SYMBOL_TRADE_MODE_SHORTONLY"),
     }
-
     if int(info["trade_mode"]) not in allowed_modes:
-        return None
+        return reject(f"Broker trade mode blocked (mode={info['trade_mode']})")
 
-    spread_limit = float(
-        CFG.MAX_SPREAD_BY_SYMBOL.get(symbol, CFG.MAX_SPREAD_POINTS)
-    )
-
-    if spread_points(tick, info) > spread_limit:
-        return None
+    spread_limit = float(CFG.MAX_SPREAD_BY_SYMBOL.get(symbol, CFG.MAX_SPREAD_POINTS))
+    current_spread = spread_points(tick, info)
+    if current_spread > spread_limit:
+        return reject(f"Spread too high ({current_spread:.1f} pts > {spread_limit:.1f} pts)")
 
     entry = float(tick["ask"] if buy else tick["bid"])
     volatility = float(candidate["atr"])
-
     if volatility <= 0:
-        return None
+        return reject("ATR is <= 0")
 
-    if (
-        abs(entry - candidate["signal_close"])
-        > CFG.MAX_ENTRY_DRIFT_ATR * volatility
-    ):
-        return None
+    drift = abs(entry - candidate["signal_close"])
+    max_drift = CFG.MAX_ENTRY_DRIFT_ATR * volatility
+    if drift > max_drift:
+        return reject(f"Entry drift too high ({drift:.5f} > Max: {max_drift:.5f})")
 
     zone = candidate["zone"]
     buffer = CFG.SL_BUFFER_ATR * volatility
@@ -1682,90 +1649,56 @@ def build_order(broker, candidate, account):
         order_type = broker.constant("ORDER_TYPE_BUY")
     else:
         spread_price = float(tick["ask"]) - float(tick["bid"])
-        raw_sl = (
-            max(zone["top"], candidate["extreme"])
-            + buffer
-            + spread_price
-        )
+        raw_sl = max(zone["top"], candidate["extreme"]) + buffer + spread_price
         raw_sl = max(raw_sl, float(tick["ask"]) + gap)
         stop = price_round(raw_sl, info, upward=True)
         risk_distance = stop - entry
         order_type = broker.constant("ORDER_TYPE_SELL")
 
-    if (
-        stop <= 0
-        or risk_distance <= 0
-        or risk_distance > CFG.MAX_SL_ATR * volatility
-    ):
-        return None
+    if stop <= 0 or risk_distance <= 0:
+        return reject(f"Invalid stop geometry (Stop: {stop}, Dist: {risk_distance:.5f})")
+    if risk_distance > CFG.MAX_SL_ATR * volatility:
+        return reject(f"Stop distance too wide ({risk_distance:.5f} > Max: {CFG.MAX_SL_ATR * volatility:.5f})")
 
     if buy:
-        target = price_round(
-            max(
-                entry + CFG.TP2_RR * risk_distance,
-                float(tick["bid"]) + gap,
-            ),
-            info,
-            upward=True,
-        )
+        target = price_round(max(entry + CFG.TP2_RR * risk_distance, float(tick["bid"]) + gap), info, upward=True)
     else:
-        target = price_round(
-            min(
-                entry - CFG.TP2_RR * risk_distance,
-                float(tick["ask"]) - gap,
-            ),
-            info,
-        )
+        target = price_round(min(entry - CFG.TP2_RR * risk_distance, float(tick["ask"]) - gap), info)
 
     if target <= 0:
-        return None
+        return reject("Target price is invalid (<=0)")
 
     allowance = CFG.RISK_SLIPPAGE_POINTS * float(info["point"])
     worse_entry = entry + allowance if buy else entry - allowance
     worse_stop = stop - allowance if buy else stop + allowance
 
     if min(worse_entry, worse_stop) <= 0:
-        return None
+        return reject("Slippage calculation resulted in price <= 0")
 
     step = float(info["volume_step"])
     minimum = float(info["volume_min"])
     maximum = min(float(info["volume_max"]), CFG.MAX_LOT)
 
     if step <= 0 or minimum <= 0 or maximum < minimum:
-        return None
+        return reject(f"Broker volume limits invalid (Min: {minimum}, Max: {maximum}, Step: {step})")
 
-    reference_loss = abs(
-        broker.profit(
-            order_type, symbol, minimum, worse_entry, worse_stop
-        )
-    ) + CFG.COMMISSION_PER_LOT * minimum
-
+    reference_loss = abs(broker.profit(order_type, symbol, minimum, worse_entry, worse_stop)) + CFG.COMMISSION_PER_LOT * minimum
     if reference_loss <= 0:
-        return None
+        return reject("Broker profit calculation returned <= 0")
 
     estimated_per_lot = reference_loss / minimum
-
-    volume = floor_volume(
-        min(CFG.RISK_PER_TRADE / estimated_per_lot, maximum),
-        step,
-    )
+    volume = floor_volume(min(CFG.RISK_PER_TRADE / estimated_per_lot, maximum), step)
 
     if volume + CFG.EPSILON < minimum:
-        return None
+        return reject(f"Calculated volume ({volume:.4f}) < Min lot ({minimum}) (Risk budget too small for SL)")
 
-    estimated_loss = abs(
-        broker.profit(
-            order_type, symbol, volume, worse_entry, worse_stop
-        )
-    ) + CFG.COMMISSION_PER_LOT * volume
-
+    estimated_loss = abs(broker.profit(order_type, symbol, volume, worse_entry, worse_stop)) + CFG.COMMISSION_PER_LOT * volume
     if estimated_loss > CFG.RISK_PER_TRADE + CFG.EPSILON:
-        return None
+        return reject(f"Estimated loss ({estimated_loss:.2f}) > Risk budget ({CFG.RISK_PER_TRADE})")
 
     margin = broker.margin(order_type, symbol, volume, entry)
-
     if margin < 0 or margin > float(account["margin_free"]) * 0.90:
-        return None
+        return reject(f"Insufficient margin (Needed: {margin:.2f}, Free: {float(account['margin_free']):.2f})")
 
     request = {
         "action": broker.constant("TRADE_ACTION_DEAL"),
@@ -2988,6 +2921,8 @@ def main():
                         zone_id = candidate["zone_id"]
                         if zone_id not in state["seen_zones"]:
                             all_candidates.append(candidate)
+                            state["seen_zones"][zone_id] = time.time()
+                            atomic_save(state_path, state)
 
                 if all_candidates:
                     all_candidates.sort(key=lambda x: x["score"], reverse=True)
