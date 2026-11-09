@@ -3039,11 +3039,14 @@ def main():
                 )
                 time.sleep(CFG.POLL_SECONDS)
 
-            except Exception:
+            except Exception as e:
+                import traceback
+                error_msg = f"Unexpected error: {str(e)}\n{traceback.format_exc()}"
+                log(error_msg)
+                notify(error_msg)
                 status(
                     "unexpected_cycle_error",
-                    "An unexpected runtime error occurred. "
-                    "This cycle stopped without exposing external details.",
+                    "An unexpected runtime error occurred.",
                     60,
                 )
                 time.sleep(CFG.POLL_SECONDS)
