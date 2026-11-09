@@ -94,15 +94,15 @@ MAX_SPREAD_BY_SYMBOL = json.loads(
             "UKOIL": 60, 
             "XNGUSD": 80,
             "XCUUSD": 60,
-            "US30": 100, 
-            "USTEC": 100, 
-            "US500": 80, 
-            "DE30": 80, 
+            "US30": 150, 
+            "USTEC": 150, 
+            "US500": 120, 
+            "DE30": 120, 
             "FR40": 80, 
             "UK100": 80, 
-            "JP225": 120, 
-            "HK50": 120, 
-            "AUS200": 80,
+            "JP225": 150, 
+            "HK50": 150, 
+            "AUS200": 120,
             "BTCUSD": 250, 
             "ETHUSD": 150, 
             "SOLUSD": 100, 
@@ -168,7 +168,7 @@ CONFIRM_MIN_BODY_ATR = env_float("CONFIRM_MIN_BODY_ATR", 0.10)
 REQUIRE_M15_CONFIRMATION = env_bool("REQUIRE_M15_CONFIRMATION", True)
 
 SL_BUFFER_ATR = env_float("SL_BUFFER_ATR", 0.30)
-MAX_SL_ATR = env_float("MAX_SL_ATR", 3.0)
+MAX_SL_ATR = env_float("MAX_SL_ATR", 5.0)
 MAX_ENTRY_DRIFT_ATR = env_float("MAX_ENTRY_DRIFT_ATR", 1)
 
 TP1_RR = env_float("TP1_RR", 1.5)
@@ -225,7 +225,7 @@ VOL_BUILDUP_LOOKBACK = env_int("VOL_BUILDUP_LOOKBACK", 3)
 # 10. PRO TRADING FEATURES
 # ==========================================
 SKIP_IDM_TRAP_ZONES = env_bool("SKIP_IDM_TRAP_ZONES", True)
-MIN_SCORING_THRESHOLD = env_float("MIN_SCORING_THRESHOLD", 5.0)
+MIN_SCORING_THRESHOLD = env_float("MIN_SCORING_THRESHOLD", 4.5)
 
 # ==========================================
 # 11. MITIGATION BLOCK & PRO FEATURES
