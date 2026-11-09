@@ -156,52 +156,66 @@ def analyze_order_flow(broker, symbol, side, reference_bar, bars=None):
     return min(flow_score, CFG.ORDER_FLOW_SCORE_BOOST)
 
 def scan_momentum_breakout_candidate(broker, symbol, m5_bars, side, volatility):
-    if len(m5_bars) < max(5, CFG.VOLUME_MA_PERIOD):
+    if len(m5_bars) < max(105, CFG.VOLUME_MA_PERIOD):
         return None
 
     latest = m5_bars[-1]
     prev = m5_bars[-2]
     buy = side == "BUY"
-
+    
+    bigbeluga = calculate_bigbeluga_momentum(m5_bars, length=50, smooth=50)
+    
+    if bigbeluga["direction"] == 0:
+        return None
+    
+    if buy and bigbeluga["direction"] != 1:
+        return None
+    
+    if not buy and bigbeluga["direction"] != -1:
+        return None
+    
     body = abs(latest["close"] - latest["open"])
     ref_atr = volatility[-1]
-
+    
     if ref_atr <= 0 or body < ref_atr * 1.2:
         return None
-
-    zone_key = f"{symbol}:MOMENTUM_BREAKOUT:{side}:{latest['time']}"
-
+    
+    zone_key = f"{symbol}:MOMENTUM_BIGBELUGA:{side}:{latest['time']}"
+    
     is_breakout = False
     extreme = None
-
+    
     if buy and latest["close"] > prev["high"] and latest["close"] > latest["open"]:
         is_breakout = True
         extreme = min(b["low"] for b in m5_bars[-3:-1])
     elif not buy and latest["close"] < prev["low"] and latest["close"] < latest["open"]:
         is_breakout = True
         extreme = max(b["high"] for b in m5_bars[-3:-1])
-
+    
     if not is_breakout or extreme is None:
         return None
-
+    
     max_wick_ratio = getattr(CFG, "MAX_SWEEP_WICK_RATIO", 0.70)
     if not wick_rejection_ok(latest, side, max_wick_ratio):
         return None
-
+    
     if not has_consolidation_before_breakout(m5_bars, len(m5_bars) - 1):
         return None
-
+    
     score = 4.0
     has_volume_boost = False
     has_sweep_boost = False
-
+    
     if body >= ref_atr * 1.8:
         score += 2.0
     elif body >= ref_atr * 1.4:
         score += 1.2
     elif body >= ref_atr * 1.2:
         score += 0.5
-
+    
+    if bigbeluga["is_strong"]:
+        score += 2.5
+    
     vol_ma = volume_ma(m5_bars[:-1], CFG.VOLUME_MA_PERIOD)
     if vol_ma:
         avg_vol = vol_ma[-1]
@@ -214,36 +228,37 @@ def scan_momentum_breakout_candidate(broker, symbol, m5_bars, side, volatility):
             elif vol_ratio >= 1.2:
                 score += 1.5
                 has_volume_boost = True
-
+    
     if (buy and latest["close"] > latest["open"]) or (not buy and latest["close"] < latest["open"]):
         score += 0.5
-
+    
     try:
         if check_trendline_liquidity_sweep(m5_bars, side):
             score += 1.5
             has_sweep_boost = True
     except Exception:
         pass
-
+    
     if not has_volume_boost and not has_sweep_boost:
         return None
-
+    
     final_score = min(score, 10.0)
-
+    
     if buy:
-        zone = {"kind": "MOMENTUM_BREAKOUT", "side": "BUY", "bottom": extreme, "top": latest["close"]}
+        zone = {"kind": "MOMENTUM_BIGBELUGA", "side": "BUY", "bottom": extreme, "top": latest["close"]}
     else:
-        zone = {"kind": "MOMENTUM_BREAKOUT", "side": "SELL", "bottom": latest["close"], "top": extreme}
-
+        zone = {"kind": "MOMENTUM_BIGBELUGA", "side": "SELL", "bottom": latest["close"], "top": extreme}
+    
     return {
         "zone": zone,
         "side": side,
         "extreme": extreme,
         "atr": ref_atr,
         "signal_close": latest["close"],
-        "signal_time": int(latest["time"] + 300),
+        "signal_time": int(latest["time"] + 60),
         "score": final_score,
         "zone_id": zone_key,
+        "bigbeluga_target": bigbeluga["target_up"] if buy else bigbeluga["target_down"],
     }
 
 def detect_market_regime(h4_bars):
@@ -359,6 +374,79 @@ def volume_ma(bars, period=20):
         chunk = volumes[start:i+1]
         result.append(sum(chunk) / len(chunk))
     return result
+
+def calculate_wma(values, period):
+    if len(values) < period or period <= 0:
+        return list(values)
+    result = []
+    weights = list(range(1, period + 1))
+    weight_sum = sum(weights)
+    for i in range(len(values)):
+        if i < period - 1:
+            result.append(values[i])
+            continue
+        chunk = values[i - period + 1 : i + 1]
+        result.append(sum(v * w for v, w in zip(chunk, weights)) / weight_sum)
+    return result
+
+
+def calculate_hma(values, period):
+    if len(values) < period or period <= 1:
+        return list(values)
+    half_period = max(2, period // 2)
+    sqrt_period = max(2, int(period ** 0.5))
+    wma_half = calculate_wma(values, half_period)
+    wma_full = calculate_wma(values, period)
+    diff = [2 * wma_half[i] - wma_full[i] for i in range(len(values))]
+    return calculate_wma(diff, sqrt_period)
+
+
+def calculate_bigbeluga_momentum(m5_bars, length=50, smooth=50, mult_dist=1.0):
+    default_out = {
+        "direction": 0, "mom_value": 0.0, "is_strong": False,
+        "dist": 0.0, "target_up": 0.0, "target_down": 0.0,
+    }
+    
+    if len(m5_bars) < length + smooth + 10:
+        return default_out
+    
+    closes = [bar["close"] for bar in m5_bars]
+    highs = [bar["high"] for bar in m5_bars]
+    lows = [bar["low"] for bar in m5_bars]
+    
+    raw_mom = [closes[i] - closes[i - length] for i in range(length, len(closes))]
+    if len(raw_mom) < smooth + 5:
+        return default_out
+    
+    mom_series = calculate_hma(raw_mom, smooth)
+    if len(mom_series) < 3:
+        return default_out
+    
+    cur = mom_series[-1]
+    prev = mom_series[-2]
+    prev2 = mom_series[-3]
+    
+    rising = cur > prev2 and prev <= prev2
+    falling = cur < prev2 and prev >= prev2
+    
+    direction = 1 if rising else (-1 if falling else 0)
+    
+    is_strong = (rising and cur < 0) or (falling and cur > 0)
+    
+    recent_ranges = [(highs[i] - lows[i]) for i in range(max(0, len(highs) - 100), len(highs))]
+    dist = (sum(recent_ranges) / len(recent_ranges)) * mult_dist if recent_ranges else 0.0
+    
+    current_high = highs[-1]
+    current_low = lows[-1]
+    
+    return {
+        "direction": direction,
+        "mom_value": cur,
+        "is_strong": is_strong,
+        "dist": dist,
+        "target_up": current_high + dist * 3,
+        "target_down": current_low - dist * 3,
+    }
 
 def validate_config():
     if not CFG.SYMBOLS or len(CFG.SYMBOLS) != len(set(CFG.SYMBOLS)):
@@ -1661,9 +1749,20 @@ def build_order(broker, candidate, account):
         return reject(f"Stop distance too wide ({risk_distance:.5f} > Max: {CFG.MAX_SL_ATR * volatility:.5f})")
 
     if buy:
-        target = price_round(max(entry + CFG.TP2_RR * risk_distance, float(tick["bid"]) + gap), info, upward=True)
+        tp_from_rr = entry + CFG.TP2_RR * risk_distance
+        target = price_round(max(tp_from_rr, float(tick["bid"]) + gap), info, upward=True)
     else:
-        target = price_round(min(entry - CFG.TP2_RR * risk_distance, float(tick["ask"]) - gap), info)
+        tp_from_rr = entry - CFG.TP2_RR * risk_distance
+        target = price_round(min(tp_from_rr, float(tick["ask"]) - gap), info)
+    
+    if "bigbeluga_target" in candidate and candidate["bigbeluga_target"] > 0:
+        bb_target = candidate["bigbeluga_target"]
+        if buy:
+            if bb_target > entry and bb_target < target:
+                target = price_round(bb_target, info, upward=True)
+        else:
+            if bb_target < entry and bb_target > target:
+                target = price_round(bb_target, info, upward=False)
 
     if target <= 0:
         return reject("Target price is invalid (<=0)")

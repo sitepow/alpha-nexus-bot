@@ -169,7 +169,7 @@ REQUIRE_M15_CONFIRMATION = env_bool("REQUIRE_M15_CONFIRMATION", True)
 
 SL_BUFFER_ATR = env_float("SL_BUFFER_ATR", 0.30)
 MAX_SL_ATR = env_float("MAX_SL_ATR", 3.0)
-MAX_ENTRY_DRIFT_ATR = env_float("MAX_ENTRY_DRIFT_ATR", 0.50)
+MAX_ENTRY_DRIFT_ATR = env_float("MAX_ENTRY_DRIFT_ATR", 1)
 
 TP1_RR = env_float("TP1_RR", 1.5)
 TP2_RR = env_float("TP2_RR", 2.5)
