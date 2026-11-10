@@ -45,10 +45,10 @@ SYMBOLS = [
     for item in os.getenv(
         "SYMBOLS",
         "EURUSD,GBPUSD,USDJPY,AUDUSD,USDCAD,NZDUSD,USDCHF,"
-        "EURGBP,EURJPY,GBPJPY,AUDJPY,GBPCAD,EURAUD,EURNZD,GBPNZD,AUDNZD,CADJPY,CHFJPY,"
-        "XAUUSD,XAGUSD,XPTUSD,XPDUSD,USOIL,UKOIL,XNGUSD,XCUUSD,"
-        "US30,USTEC,US500,DE30,FR40,UK100,JP225,HK50,AUS200,"
-        "BTCUSD,ETHUSD,SOLUSD,XRPUSD,BNBUSD,ADAUSD,DOGEUSD,LINKUSD,DOTUSD"
+        "EURGBP,EURJPY,GBPJPY,AUDJPY,EURAUD,GBPCAD,"
+        "XAUUSD,USOIL,"
+        "US30,USTEC,US500,DE30,"
+        "BTCUSD,ETHUSD"
     ).split(",")
     if item.strip()
 ]
@@ -80,37 +80,32 @@ MAX_DAILY_LOSS_PCT = env_float("MAX_DAILY_LOSS_PCT", 0.05)
 MAX_CONSECUTIVE_LOSSES = env_int("MAX_CONSECUTIVE_LOSSES", 3)
 COOLDOWN_SECONDS = env_float("COOLDOWN_SECONDS", 3600)
 
-MAX_SPREAD_POINTS = env_float("MAX_SPREAD_POINTS", 30)
+MAX_SPREAD_POINTS = env_float("MAX_SPREAD_POINTS", 25)
 MAX_SPREAD_BY_SYMBOL = json.loads(
     os.getenv(
         "MAX_SPREAD_BY_SYMBOL_JSON",
         json.dumps({
-            "XAUUSD": 80, 
-            "XAGUSD": 50, 
-            "XPTUSD": 70, 
-            "XPDUSD": 70, 
-            "USOIL": 60, 
-            "UKOIL": 60, 
-            "XNGUSD": 80,
-            "XCUUSD": 60,
-            "US30": 150, 
-            "USTEC": 150, 
-            "US500": 120, 
-            "DE30": 120, 
-            "FR40": 80, 
-            "UK100": 80, 
-            "JP225": 150, 
-            "HK50": 150, 
-            "AUS200": 120,
-            "BTCUSD": 250, 
-            "ETHUSD": 150, 
-            "SOLUSD": 100, 
-            "XRPUSD": 80, 
-            "BNBUSD": 100, 
-            "ADAUSD": 80, 
-            "DOGEUSD": 80, 
-            "LINKUSD": 80, 
-            "DOTUSD": 80
+            "EURUSD": 20,
+            "USDJPY": 22,
+            "GBPUSD": 25,
+            "AUDUSD": 25,
+            "USDCAD": 25,
+            "NZDUSD": 25,
+            "USDCHF": 25,
+            "EURGBP": 25,
+            "EURJPY": 30,
+            "AUDJPY": 30,
+            "GBPJPY": 35,
+            "EURAUD": 40,
+            "GBPCAD": 40,
+            "XAUUSD": 60,
+            "USOIL": 50,
+            "US30": 300,
+            "USTEC": 250,
+            "US500": 120,
+            "DE30": 180,
+            "BTCUSD": 3000,
+            "ETHUSD": 1200
         })
     )
 )
