@@ -2877,6 +2877,18 @@ def in_session():
     if CFG.USE_KILLZONES_ONLY:
         return is_prime_killzone_utc()
 
+    if getattr(CFG, "USE_AUTO_DST_KILLZONES", True):
+        try:
+            from zoneinfo import ZoneInfo
+            now_utc = utc_now()
+            london_hour = now_utc.astimezone(ZoneInfo("Europe/London")).hour
+            ny_hour = now_utc.astimezone(ZoneInfo("America/New_York")).hour
+            if (7 <= london_hour < 17) or (7 <= ny_hour < 17):
+                return True
+            return False
+        except Exception:
+            pass
+
     if CFG.SESSION_START_HOUR_UTC == CFG.SESSION_END_HOUR_UTC:
         return True
 
