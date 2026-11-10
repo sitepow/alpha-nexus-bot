@@ -156,11 +156,19 @@ def analyze_order_flow(broker, symbol, side, reference_bar, bars=None):
     return min(flow_score, CFG.ORDER_FLOW_SCORE_BOOST)
 
 def scan_momentum_breakout_candidate(broker, symbol, m5_bars, side, volatility):
-    if len(m5_bars) < max(105, CFG.VOLUME_MA_PERIOD):
+    if len(m5_bars) < max(210, CFG.VOLUME_MA_PERIOD):
         return None
 
     latest = m5_bars[-1]
     buy = side == "BUY"
+
+    closes = [b["close"] for b in m5_bars]
+    m5_ema50 = ema(closes, 50)[-1]
+    m5_ema200 = ema(closes, 200)[-1]
+    if buy and not (latest["close"] > m5_ema200 and m5_ema50 >= m5_ema200):
+        return None
+    if not buy and not (latest["close"] < m5_ema200 and m5_ema50 <= m5_ema200):
+        return None
 
     bigbeluga = calculate_bigbeluga_momentum(m5_bars, length=50, smooth=50)
 
@@ -1684,12 +1692,7 @@ def scan_symbol(broker, symbol, state):
 
     candidates = []
 
-    if regime in ("STRONG_TREND", "RETRACEMENT_SMC"):
-        mom = scan_momentum_breakout_candidate(broker, symbol, m5, side, volatility)
-        if mom is not None and mom["side"] == side:
-            if regime == "RETRACEMENT_SMC":
-                mom["score"] = max(0.0, mom["score"] - 1.0)
-            candidates.append(("momentum", mom))
+    news_catalyst = get_news_sentiment_score(symbol, side, m5_bars=m5)
 
     if regime != "RANGING_SIDEWAY":
         for zone in create_zones(symbol, m15, side):
@@ -1704,6 +1707,11 @@ def scan_symbol(broker, symbol, state):
                 candidates.append(("smc", sig))
                 if len(candidates) >= 6:
                     break
+
+    if regime == "STRONG_TREND" or (regime == "RETRACEMENT_SMC" and news_catalyst >= 1.5):
+        mom = scan_momentum_breakout_candidate(broker, symbol, m5, side, volatility)
+        if mom is not None and mom["side"] == side:
+            candidates.append(("momentum", mom))
 
     if not candidates:
         return None
@@ -1730,7 +1738,11 @@ def scan_symbol(broker, symbol, state):
         news_sentiment = get_news_sentiment_score(symbol, candidate["side"], m5_bars=m5)
         candidate["score"] += news_sentiment
 
-    eligible = [(k, c) for (k, c) in candidates if c["score"] >= CFG.MIN_SCORING_THRESHOLD]
+    mom_min_threshold = max(CFG.MIN_SCORING_THRESHOLD + 1.5, 7.5)
+    eligible = [
+        (k, c) for (k, c) in candidates
+        if c["score"] >= (CFG.MIN_SCORING_THRESHOLD if k == "smc" else mom_min_threshold)
+    ]
     if not eligible:
         return None
 
@@ -1740,13 +1752,13 @@ def scan_symbol(broker, symbol, state):
     best_mom = max(mom_pool, key=lambda c: c["score"]) if mom_pool else None
     best_smc = max(smc_pool, key=lambda c: c["score"]) if smc_pool else None
 
-    if best_mom is not None and best_smc is not None:
-        if best_mom["score"] >= best_smc["score"] - 0.5:
+    if best_smc is not None and best_mom is not None:
+        if best_mom["score"] >= best_smc["score"] + 1.5:
             chosen = best_mom
         else:
             chosen = best_smc
     else:
-        chosen = best_mom if best_mom is not None else best_smc
+        chosen = best_smc if best_smc is not None else best_mom
 
     chosen["symbol"] = symbol
     return chosen
