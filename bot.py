@@ -1552,6 +1552,8 @@ def get_news_sentiment_score(symbol, side, m5_bars=None):
 
     post_window = float(getattr(CFG, "NEWS_POST_SENTIMENT_MINUTES", 90.0))
     sentiment_score = 0.0
+    max_boost = float(getattr(CFG, "NEWS_SCORE_BOOST_HIGH", 3.0))
+    max_penalty = float(getattr(CFG, "NEWS_HIGH_IMPACT_PENALTY", 4.0))
 
     with SHARED_NEWS_FETCHER._lock:
         for news in SHARED_NEWS_FETCHER.high_impact_news:
@@ -1600,15 +1602,15 @@ def get_news_sentiment_score(symbol, side, m5_bars=None):
                     if ref_range > 0 and abs(net_move) >= ref_range * 1.2:
                         favorable_side = "BUY" if net_move > 0 else "SELL"
 
-            boost_val = getattr(CFG, "NEWS_SCORE_BOOST_HIGH", 3.0) if impact == "High" else getattr(CFG, "NEWS_SCORE_BOOST_MED", 1.5)
-            penalty_val = CFG.NEWS_HIGH_IMPACT_PENALTY if impact == "High" else CFG.NEWS_MEDIUM_IMPACT_PENALTY
+            boost_val = float(getattr(CFG, "NEWS_SCORE_BOOST_HIGH", 3.0) if impact == "High" else getattr(CFG, "NEWS_SCORE_BOOST_MED", 1.5))
+            penalty_val = float(CFG.NEWS_HIGH_IMPACT_PENALTY if impact == "High" else CFG.NEWS_MEDIUM_IMPACT_PENALTY)
 
             if favorable_side == side:
                 sentiment_score += boost_val
             elif favorable_side != "NEUTRAL" and favorable_side != side:
                 sentiment_score -= penalty_val
 
-    return max(-penalty_val, min(sentiment_score, boost_val))
+    return max(-max_penalty, min(sentiment_score, max_boost))
 
 def news_permission(broker, symbol):
     if not CFG.ENABLE_NEWS_FILTER:
