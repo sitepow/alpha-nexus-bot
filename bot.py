@@ -289,8 +289,21 @@ def scan_momentum_breakout_candidate(broker, symbol, m5_bars, side, volatility):
         "bigbeluga_target": bigbeluga["target_up"] if buy else bigbeluga["target_down"],
     }
 
-def detect_market_regime(h4_bars):
-    if len(h4_bars) < 30:
+def calculate_efficiency_ratio(closes, period=10):
+    if len(closes) < period + 1:
+        return 0.5
+    net_change = abs(closes[-1] - closes[-(period + 1)])
+    sum_changes = sum(
+        abs(closes[i] - closes[i - 1])
+        for i in range(len(closes) - period, len(closes))
+    )
+    if sum_changes <= 1e-12:
+        return 0.0
+    return net_change / sum_changes
+
+
+def detect_market_regime(h4_bars, m15_bars=None):
+    if len(h4_bars) < 35:
         return "RETRACEMENT_SMC"
 
     closes = [bar["close"] for bar in h4_bars]
@@ -299,20 +312,34 @@ def detect_market_regime(h4_bars):
     h4_volatility = atr(h4_bars)
     ref_h4_atr = h4_volatility[-1] if h4_volatility and h4_volatility[-1] > 0 else (ema_slow[-1] * 0.002)
 
-    ema_gap = abs(ema_fast[-1] - ema_slow[-1])
-    trend_aligned = ema_gap >= (ref_h4_atr * 0.35)
+    ema_gap_now = abs(ema_fast[-1] - ema_slow[-1])
+    ema_gap_prev = abs(ema_fast[-4] - ema_slow[-4])
+    ema_expanding = ema_gap_now >= ema_gap_prev * 0.98
 
-    highs, lows = swings(h4_bars, CFG.HTF_SWING_WINDOW)
-    if len(highs) >= 2 and len(lows) >= 2:
-        recent_range_span = abs(highs[-1]["price"] - lows[-1]["price"])
-        span_count = min(5, len(highs), len(lows))
-        avg_span = sum(abs(h["price"] - l["price"]) for h, l in zip(highs[-span_count:], lows[-span_count:])) / span_count
+    h4_er = calculate_efficiency_ratio(closes, period=10)
+    m15_er = 0.35
+    m15_vol_expanding = True
+    if m15_bars and len(m15_bars) >= 35:
+        m15_closes = [b["close"] for b in m15_bars]
+        m15_er = calculate_efficiency_ratio(m15_closes, period=16)
+        m15_atr_series = atr(m15_bars)
+        if len(m15_atr_series) >= 25:
+            recent_m15_atr = sum(m15_atr_series[-5:]) / 5.0
+            base_m15_atr = sum(m15_atr_series[-25:-5]) / 20.0
+            m15_vol_expanding = recent_m15_atr >= base_m15_atr * 0.90
 
-        if ema_gap >= (ref_h4_atr * 0.80) and recent_range_span > avg_span * 1.25:
-            return "STRONG_TREND"
-
-    if not trend_aligned:
+    if ema_gap_now < (ref_h4_atr * 0.30):
         return "RANGING_SIDEWAY"
+    if h4_er < 0.15 and m15_er < 0.15 and not m15_vol_expanding:
+        return "RANGING_SIDEWAY"
+
+    if (
+        ema_gap_now >= (ref_h4_atr * 0.75)
+        and ema_expanding
+        and (h4_er >= 0.42 or m15_er >= 0.45)
+        and m15_vol_expanding
+    ):
+        return "STRONG_TREND"
 
     return "RETRACEMENT_SMC"
 
@@ -1681,7 +1708,7 @@ def scan_symbol(broker, symbol, state):
     h4 = [bar for bar in h4 if bar["time"] + 14400 <= decision_time]
     m15 = [bar for bar in m15 if bar["time"] + 900 <= decision_time]
 
-    regime = detect_market_regime(h4)
+    regime = detect_market_regime(h4, m15)
     side = htf_bias(h4)
 
     if side == "NEUTRAL" or len(m15) < CFG.DEALING_RANGE_BARS + 10:
