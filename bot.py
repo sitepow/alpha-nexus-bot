@@ -415,7 +415,33 @@ def calculate_pdh_pdl(broker, symbol):
     return pdh, pdl
 
 
+def get_active_killzones_utc():
+    if not getattr(CFG, "USE_AUTO_DST_KILLZONES", True):
+        return list(CFG.KILLZONES_UTC)
+    try:
+        from zoneinfo import ZoneInfo
+        now_utc = utc_now()
+        london_hour = now_utc.astimezone(ZoneInfo("Europe/London")).hour
+        ny_hour = now_utc.astimezone(ZoneInfo("America/New_York")).hour
+        lon_start_utc = (now_utc.hour - (london_hour - 8)) % 24
+        lon_end_utc = (lon_start_utc + 3) % 24
+        ny_start_utc = (now_utc.hour - (ny_hour - 8)) % 24
+        ny_end_utc = (ny_start_utc + 4) % 24
+        return [(lon_start_utc, lon_end_utc), (ny_start_utc, ny_end_utc)]
+    except Exception:
+        return list(CFG.KILLZONES_UTC)
+
+
 def is_prime_killzone_utc():
+    if getattr(CFG, "USE_AUTO_DST_KILLZONES", True):
+        try:
+            from zoneinfo import ZoneInfo
+            now_utc = utc_now()
+            london_hour = now_utc.astimezone(ZoneInfo("Europe/London")).hour
+            ny_hour = now_utc.astimezone(ZoneInfo("America/New_York")).hour
+            return (8 <= london_hour < 11) or (8 <= ny_hour < 12)
+        except Exception:
+            pass
     hour = utc_now().hour
     for start_k, end_k in CFG.KILLZONES_UTC:
         if start_k <= hour < end_k:
@@ -1872,6 +1898,7 @@ def scan_symbol(broker, symbol, state):
         chosen = best_smc if best_smc is not None else best_mom
 
     chosen["symbol"] = symbol
+    chosen["regime"] = regime
     return chosen
 
 def dynamic_risk_budget(account, score=6.0):
@@ -1907,6 +1934,45 @@ def dynamic_max_open_positions(account):
     if balance < 200.0:
         return min(base_max, 2)
     return base_max
+
+
+def dynamic_daily_trade_limit(snapshot):
+    base_limit = int(CFG.MAX_DAILY_TRADES)
+    if not getattr(CFG, "USE_DYNAMIC_DAILY_TRADES", True):
+        return base_limit
+
+    account = snapshot.get("account", {})
+    balance = float(account.get("balance", 0.0))
+    daily_pnl = float(snapshot.get("daily_pnl", 0.0))
+    if balance <= 0:
+        return base_limit
+
+    pnl_pct = (daily_pnl / balance) * 100.0
+    if pnl_pct >= 2.5:
+        return max(base_limit, min(base_limit + 2, 10))
+    if pnl_pct >= 0.5:
+        return max(base_limit, 8)
+    if pnl_pct <= -2.5:
+        return max(4, base_limit - 2)
+    return base_limit
+
+
+def dynamic_tp_rr(candidate):
+    base_tp2 = float(CFG.TP2_RR)
+    if not getattr(CFG, "USE_DYNAMIC_TP_SCALING", True):
+        return base_tp2
+
+    regime = candidate.get("regime", "RETRACEMENT_SMC")
+    score = float(candidate.get("score", 7.0))
+    kind = candidate.get("zone", {}).get("kind", "OB")
+
+    if regime == "STRONG_TREND" and score >= 11.0:
+        return max(base_tp2, 3.2)
+    if regime == "STRONG_TREND" or score >= 11.0:
+        return max(base_tp2, 2.8)
+    if regime == "RETRACEMENT_SMC" and score < 7.5 and kind != "MOMENTUM_BIGBELUGA":
+        return min(base_tp2, 2.2)
+    return base_tp2
 
 
 def floor_volume(volume, step):
@@ -2051,11 +2117,12 @@ def build_order(broker, candidate, account):
     if risk_distance > CFG.MAX_SL_ATR * volatility:
         return reject(f"Stop distance too wide ({risk_distance:.5f} > Max: {CFG.MAX_SL_ATR * volatility:.5f})")
 
+    effective_tp2_rr = dynamic_tp_rr(candidate)
     if buy:
-        tp_from_rr = entry + CFG.TP2_RR * risk_distance
+        tp_from_rr = entry + effective_tp2_rr * risk_distance
         target = price_round(max(tp_from_rr, float(tick["bid"]) + gap), info, upward=True)
     else:
-        tp_from_rr = entry - CFG.TP2_RR * risk_distance
+        tp_from_rr = entry - effective_tp2_rr * risk_distance
         target = price_round(min(tp_from_rr, float(tick["ask"]) - gap), info)
     
     if "bigbeluga_target" in candidate and candidate["bigbeluga_target"] > 0:
@@ -2816,10 +2883,7 @@ def in_session():
     hour = utc_now().hour
 
     if CFG.USE_KILLZONES_ONLY:
-        for start_k, end_k in CFG.KILLZONES_UTC:
-            if start_k <= hour < end_k:
-                return True
-        return False
+        return is_prime_killzone_utc()
 
     if CFG.SESSION_START_HOUR_UTC == CFG.SESSION_END_HOUR_UTC:
         return True
@@ -2849,7 +2913,7 @@ def entry_permission(broker, state, snapshot, positions, orders):
     if time.time() < float(state["cooldown_until"]):
         return False, "The consecutive-loss cooldown is active."
 
-    if snapshot["daily_entries"] >= CFG.MAX_DAILY_TRADES:
+    if snapshot["daily_entries"] >= dynamic_daily_trade_limit(snapshot):
         return False, "The daily entry limit has been reached."
 
     bot_positions = [
@@ -3011,10 +3075,21 @@ def manage_positions(broker, state, path):
         )
 
         age_seconds = time.time() - float(record["opened_at"])
+        base_exit_min = float(CFG.TIME_EXIT_MINUTES)
+        if getattr(CFG, "USE_DYNAMIC_TIME_EXIT", True):
+            if current_r >= 0.05 or is_prime_killzone_utc():
+                effective_exit_min = base_exit_min * 1.35
+            elif current_r <= -0.35:
+                effective_exit_min = max(45.0, base_exit_min * 0.72)
+            else:
+                effective_exit_min = base_exit_min
+        else:
+            effective_exit_min = base_exit_min
 
         if (
             CFG.ENABLE_TIME_EXIT
-            and age_seconds >= CFG.TIME_EXIT_MINUTES * 60
+            and not record.get("partial_done", False)
+            and age_seconds >= effective_exit_min * 60
             and current_r < CFG.TIME_EXIT_MIN_R
         ):
             request = partial_request(broker, position, volume)
