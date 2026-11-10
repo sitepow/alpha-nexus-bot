@@ -160,62 +160,69 @@ def scan_momentum_breakout_candidate(broker, symbol, m5_bars, side, volatility):
         return None
 
     latest = m5_bars[-1]
-    prev = m5_bars[-2]
     buy = side == "BUY"
-    
+
     bigbeluga = calculate_bigbeluga_momentum(m5_bars, length=50, smooth=50)
-    
+
     if bigbeluga["direction"] == 0:
         return None
-    
+
     if buy and bigbeluga["direction"] != 1:
         return None
-    
+
     if not buy and bigbeluga["direction"] != -1:
         return None
-    
+
     body = abs(latest["close"] - latest["open"])
-    ref_atr = volatility[-1]
-    
-    if ref_atr <= 0 or body < ref_atr * 1.2:
+    ref_atr = volatility[-2] if len(volatility) >= 2 else volatility[-1]
+
+    if ref_atr <= 0 or body < ref_atr * 1.0 or body > ref_atr * 2.8:
         return None
-    
+
     zone_key = f"{symbol}:MOMENTUM_BIGBELUGA:{side}:{latest['time']}"
-    
+
+    range_lookback = 12
+    prior_box = m5_bars[-(range_lookback + 1):-1]
+    box_high = max(b["high"] for b in prior_box)
+    box_low = min(b["low"] for b in prior_box)
+    close_buffer = CFG.BOS_BUFFER_ATR * ref_atr
+
     is_breakout = False
     extreme = None
-    
-    if buy and latest["close"] > prev["high"] and latest["close"] > latest["open"]:
+
+    if buy and latest["close"] > box_high + close_buffer and latest["close"] > latest["open"]:
         is_breakout = True
-        extreme = min(b["low"] for b in m5_bars[-3:-1])
-    elif not buy and latest["close"] < prev["low"] and latest["close"] < latest["open"]:
+        swing_low = min(b["low"] for b in m5_bars[-4:])
+        extreme = max(swing_low, latest["close"] - (ref_atr * 2.5))
+    elif not buy and latest["close"] < box_low - close_buffer and latest["close"] < latest["open"]:
         is_breakout = True
-        extreme = max(b["high"] for b in m5_bars[-3:-1])
-    
+        swing_high = max(b["high"] for b in m5_bars[-4:])
+        extreme = min(swing_high, latest["close"] + (ref_atr * 2.5))
+
     if not is_breakout or extreme is None:
         return None
-    
-    max_wick_ratio = getattr(CFG, "MAX_SWEEP_WICK_RATIO", 0.70)
+
+    max_wick_ratio = min(getattr(CFG, "MAX_SWEEP_WICK_RATIO", 0.70), 0.35)
     if not wick_rejection_ok(latest, side, max_wick_ratio):
         return None
-    
-    if not has_consolidation_before_breakout(m5_bars, len(m5_bars) - 1):
+
+    if not has_consolidation_before_breakout(m5_bars, len(m5_bars) - 1, lookback=range_lookback):
         return None
-    
+
     score = 4.0
     has_volume_boost = False
     has_sweep_boost = False
-    
-    if body >= ref_atr * 1.8:
+
+    if body >= ref_atr * 1.6:
         score += 2.0
-    elif body >= ref_atr * 1.4:
+    elif body >= ref_atr * 1.3:
         score += 1.2
-    elif body >= ref_atr * 1.2:
+    else:
         score += 0.5
-    
+
     if bigbeluga["is_strong"]:
         score += 2.5
-    
+
     vol_ma = volume_ma(m5_bars[:-1], CFG.VOLUME_MA_PERIOD)
     if vol_ma:
         avg_vol = vol_ma[-1]
@@ -228,34 +235,37 @@ def scan_momentum_breakout_candidate(broker, symbol, m5_bars, side, volatility):
             elif vol_ratio >= 1.2:
                 score += 1.5
                 has_volume_boost = True
-    
-    if (buy and latest["close"] > latest["open"]) or (not buy and latest["close"] < latest["open"]):
+
+    if is_volume_building_up(m5_bars, len(m5_bars) - 1, getattr(CFG, "VOL_BUILDUP_LOOKBACK", 3)):
         score += 0.5
-    
+
     try:
         if check_trendline_liquidity_sweep(m5_bars, side):
             score += 1.5
             has_sweep_boost = True
     except Exception:
         pass
-    
-    if not has_volume_boost and not has_sweep_boost:
+
+    order_flow_points = analyze_order_flow(broker, symbol, side, latest, m5_bars[:-1])
+    score += order_flow_points
+
+    if not has_volume_boost and not has_sweep_boost and order_flow_points <= 0:
         return None
-    
+
     final_score = min(score, 10.0)
-    
+
     if buy:
         zone = {"kind": "MOMENTUM_BIGBELUGA", "side": "BUY", "bottom": extreme, "top": latest["close"]}
     else:
         zone = {"kind": "MOMENTUM_BIGBELUGA", "side": "SELL", "bottom": latest["close"], "top": extreme}
-    
+
     return {
         "zone": zone,
         "side": side,
         "extreme": extreme,
-        "atr": ref_atr,
+        "atr": volatility[-1],
         "signal_close": latest["close"],
-        "signal_time": int(latest["time"] + 60),
+        "signal_time": int(latest["time"] + 300),
         "score": final_score,
         "zone_id": zone_key,
         "bigbeluga_target": bigbeluga["target_up"] if buy else bigbeluga["target_down"],
@@ -292,11 +302,6 @@ def is_volume_building_up(bars, index, lookback=3):
     return vols[-1] >= sum(vols) / len(vols)
 
 def safe_text(text):
-    """
-    Keep application output ASCII-only.
-
-    External broker comments and raw exception messages are never forwarded.
-    """
     return "".join(
         char
         for char in str(text)
@@ -406,46 +411,48 @@ def calculate_bigbeluga_momentum(m5_bars, length=50, smooth=50, mult_dist=1.0):
         "direction": 0, "mom_value": 0.0, "is_strong": False,
         "dist": 0.0, "target_up": 0.0, "target_down": 0.0,
     }
-    
+
     if len(m5_bars) < length + smooth + 10:
         return default_out
-    
+
     closes = [bar["close"] for bar in m5_bars]
     highs = [bar["high"] for bar in m5_bars]
     lows = [bar["low"] for bar in m5_bars]
-    
+
     raw_mom = [closes[i] - closes[i - length] for i in range(length, len(closes))]
     if len(raw_mom) < smooth + 5:
         return default_out
-    
+
     mom_series = calculate_hma(raw_mom, smooth)
     if len(mom_series) < 3:
         return default_out
-    
+
     cur = mom_series[-1]
     prev = mom_series[-2]
     prev2 = mom_series[-3]
-    
-    rising = cur > prev2 and prev <= prev2
-    falling = cur < prev2 and prev >= prev2
-    
+
+    rising = cur > prev
+    falling = cur < prev
+
     direction = 1 if rising else (-1 if falling else 0)
-    
-    is_strong = (rising and cur < 0) or (falling and cur > 0)
-    
+
+    bull_accel = rising and (cur > 0 or prev <= prev2) and (cur - prev) >= (prev - prev2)
+    bear_accel = falling and (cur < 0 or prev >= prev2) and (prev - cur) >= (prev2 - prev)
+    is_strong = bull_accel if rising else (bear_accel if falling else False)
+
     recent_ranges = [(highs[i] - lows[i]) for i in range(max(0, len(highs) - 100), len(highs))]
     dist = (sum(recent_ranges) / len(recent_ranges)) * mult_dist if recent_ranges else 0.0
-    
+
     current_high = highs[-1]
     current_low = lows[-1]
-    
+
     return {
         "direction": direction,
         "mom_value": cur,
         "is_strong": is_strong,
         "dist": dist,
-        "target_up": current_high + dist * 3,
-        "target_down": current_low - dist * 3,
+        "target_up": current_high + dist * 6.0,
+        "target_down": current_low - dist * 6.0,
     }
 
 def validate_config():
@@ -1752,11 +1759,14 @@ def build_order(broker, candidate, account):
     
     if "bigbeluga_target" in candidate and candidate["bigbeluga_target"] > 0:
         bb_target = candidate["bigbeluga_target"]
+        min_rr = max(CFG.TP1_RR + 0.5, 2.0)
         if buy:
-            if bb_target > entry and bb_target < target:
+            min_profitable_tp = entry + min_rr * risk_distance
+            if bb_target >= min_profitable_tp and bb_target < target:
                 target = price_round(bb_target, info, upward=True)
         else:
-            if bb_target < entry and bb_target > target:
+            min_profitable_tp = entry - min_rr * risk_distance
+            if bb_target <= min_profitable_tp and bb_target > target:
                 target = price_round(bb_target, info, upward=False)
 
     if target <= 0:
@@ -2842,25 +2852,31 @@ def validate_account(broker, expected_key):
     return account
 
 
-def has_consolidation_before_breakout(bars, breakout_idx, lookback=8, atr_ratio_threshold=0.7):
-    """True if ATR was compressed before the breakout bar (conservative default True)."""
-    if breakout_idx < lookback + 2:
+def has_consolidation_before_breakout(bars, breakout_idx, lookback=12, atr_ratio_threshold=1.15):
+    if breakout_idx < lookback + 20:
         return True
 
-    atr_series = atr(bars[:breakout_idx + 1])
-    if len(atr_series) < 20 + lookback:
+    prior_bars = bars[breakout_idx - lookback:breakout_idx]
+    if not prior_bars:
         return True
 
-    recent_atr = atr_series[breakout_idx]
-    base_atr = sum(atr_series[breakout_idx - lookback:breakout_idx]) / lookback
-
-    if recent_atr <= 0 or base_atr <= 0:
+    atr_series = atr(bars[:breakout_idx])
+    if len(atr_series) < 50:
         return True
 
-    return base_atr <= recent_atr * atr_ratio_threshold
+    baseline_atr = sum(atr_series[-50:]) / 50.0
+    if baseline_atr <= 0:
+        return True
+
+    avg_prior_range = sum(b["high"] - b["low"] for b in prior_bars) / len(prior_bars)
+    box_width = max(b["high"] for b in prior_bars) - min(b["low"] for b in prior_bars)
+
+    range_compressed = avg_prior_range <= baseline_atr * atr_ratio_threshold
+    box_contained = box_width <= baseline_atr * (lookback * 0.45)
+
+    return range_compressed and box_contained
 
 def wick_rejection_ok(bar, side, max_wick_ratio):
-    """True if the counter-direction wick is within the allowed ratio."""
     bar_range = bar["high"] - bar["low"]
     if bar_range <= 0:
         return False
