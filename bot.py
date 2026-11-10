@@ -1018,6 +1018,32 @@ def htf_bias(bars):
 
     return "NEUTRAL"
 
+def find_extreme_swing_ob_index(bars, start_index, impulse_index, buy):
+    search_start = max(0, start_index)
+    search_end = impulse_index - 1
+    if search_end < search_start:
+        return None
+
+    best_idx = search_end
+    if buy:
+        min_low = bars[search_end]["low"]
+        for i in range(search_end, search_start - 1, -1):
+            if bars[i]["low"] <= min_low:
+                min_low = bars[i]["low"]
+                best_idx = i
+        if best_idx - 1 >= 0 and bars[best_idx - 1]["low"] < bars[best_idx]["low"]:
+            best_idx -= 1
+    else:
+        max_high = bars[search_end]["high"]
+        for i in range(search_end, search_start - 1, -1):
+            if bars[i]["high"] >= max_high:
+                max_high = bars[i]["high"]
+                best_idx = i
+        if best_idx - 1 >= 0 and bars[best_idx - 1]["high"] > bars[best_idx]["high"]:
+            best_idx -= 1
+
+    return best_idx
+
 
 def first_structure_break(bars, index, side, volatility):
     prior = bars[:index]
@@ -1028,25 +1054,33 @@ def first_structure_break(bars, index, side, volatility):
     if not pivots:
         return None
 
-    pivot = pivots[-1]
-    level = pivot["price"]
+    pivot = dict(pivots[-1])
+    level = float(pivot["price"])
     close = bars[index]["close"]
     buffer = CFG.BOS_BUFFER_ATR * volatility
 
     intervening = bars[pivot["confirmed_index"] + 1:index]
 
     if buy:
-        valid = (
-            close > level + buffer
-            and all(bar["close"] <= level for bar in intervening)
-        )
+        for bar in intervening:
+            if bar["close"] > level:
+                return None
+            if bar["high"] > level and bar["close"] <= level:
+                level = float(bar["high"])
+        valid = close > level + buffer
     else:
-        valid = (
-            close < level - buffer
-            and all(bar["close"] >= level for bar in intervening)
-        )
+        for bar in intervening:
+            if bar["close"] < level:
+                return None
+            if bar["low"] < level and bar["close"] >= level:
+                level = float(bar["low"])
+        valid = close < level - buffer
 
-    return pivot if valid else None
+    if not valid:
+        return None
+
+    pivot["effective_level"] = level
+    return pivot
 
 def check_harmonic_bat_pattern(bars, side):
     highs, lows = swings(bars, CFG.STRUCTURE_SWING_WINDOW)
@@ -1194,13 +1228,17 @@ def create_zones(symbol, bars, side):
         fvg_size = (fvg_top - fvg_bottom) if buy else (fvg_top - fvg_bottom)
         has_fvg = fvg_size >= (CFG.MIN_FVG_ATR * reference_atr)
 
-        ob_index = None
+        local_ob_index = None
         for source in range(impulse_index - 1, max(-1, impulse_index - CFG.OB_SEARCH_BACK - 1), -1):
             source_bar = bars[source]
             opposite = source_bar["close"] < source_bar["open"] if buy else source_bar["close"] > source_bar["open"]
             if opposite:
-                ob_index = source
+                local_ob_index = source
                 break
+
+        swing_start = max(0, min(int(pivot["index"]), impulse_index - CFG.OB_SEARCH_BACK))
+        extreme_ob_index = find_extreme_swing_ob_index(bars, swing_start, impulse_index, buy)
+        ob_index = extreme_ob_index if extreme_ob_index is not None else local_ob_index
 
         dealing = bars[impulse_index - CFG.DEALING_RANGE_BARS:impulse_index + 1]
         range_high = max(bar["high"] for bar in dealing)
@@ -1221,6 +1259,7 @@ def create_zones(symbol, bars, side):
             pd_zone_top = range_high + (reference_atr * 0.5)
 
         created = int(right["time"] + 900)
+        bos_level_val = float(pivot.get("effective_level", pivot["price"]))
 
         def add_zone(kind, bottom, top, source_index, is_mitigation=False, confluence=False):
             if bottom >= top:
@@ -1242,38 +1281,53 @@ def create_zones(symbol, bars, side):
                 "source_time": int(bars[source_index]["time"]),
                 "local_id": key,
                 "equilibrium": float(equilibrium),
-                "bos_level": float(pivot["price"]),
+                "bos_level": bos_level_val,
                 "is_mitigation": bool(is_mitigation),
                 "confluence": bool(confluence),
             })
 
-        if ob_index is not None:
-            source_bar = bars[ob_index]
-            path_after_ob = bars[ob_index + 1 : impulse_index]
+        ob_candidates = []
+        if extreme_ob_index is not None:
+            ob_candidates.append(extreme_ob_index)
+        if local_ob_index is not None and local_ob_index not in ob_candidates:
+            ob_candidates.append(local_ob_index)
+
+        for cand_idx in ob_candidates:
+            source_bar = bars[cand_idx]
+            ob_atr = volatility[cand_idx] if volatility[cand_idx] > 0 else reference_atr
+
+            if buy:
+                ob_bottom = source_bar["low"]
+                ob_top = min(source_bar["high"], ob_bottom + (ob_atr * 1.2))
+            else:
+                ob_top = source_bar["high"]
+                ob_bottom = max(source_bar["low"], ob_top - (ob_atr * 1.2))
+
+            path_after_ob = bars[cand_idx + 1 : impulse_index]
             broken_ob = False
             for b in path_after_ob:
-                if buy and b["low"] < source_bar["low"]:
+                if buy and b["low"] < ob_bottom:
                     broken_ob = True
                     break
-                elif not buy and b["high"] > source_bar["high"]:
+                elif not buy and b["high"] > ob_top:
                     broken_ob = True
                     break
 
             if broken_ob and CFG.ENABLE_MITIGATION_BLOCK:
                 add_zone(
                     "MITIGATION_BLOCK",
-                    source_bar["low"],
-                    source_bar["high"],
-                    ob_index,
+                    ob_bottom,
+                    ob_top,
+                    cand_idx,
                     is_mitigation=True,
                     confluence=has_fvg,
                 )
             elif not broken_ob:
                 add_zone(
                     "OB",
-                    source_bar["low"],
-                    source_bar["high"],
-                    ob_index,
+                    ob_bottom,
+                    ob_top,
+                    cand_idx,
                     is_mitigation=False,
                     confluence=has_fvg,
                 )
@@ -1400,13 +1454,17 @@ def zone_signal(zone, bars, volatility, pdh=None, pdl=None, broker=None):
                 continue
             sweep_modifier -= 1.5
 
-        level = confirmation["price"]
+        level = float(confirmation["price"])
         confirmation_end = min(sweep_index + CFG.CONFIRM_AFTER_SWEEP_BARS, latest)
 
         for confirmation_index in range(sweep_index + 1, confirmation_end + 1):
             bar = bars[confirmation_index]
             raw_break = bar["close"] > level if buy else bar["close"] < level
             if not raw_break:
+                if buy and bar["high"] > level and bar["close"] <= level:
+                    level = float(bar["high"])
+                elif not buy and bar["low"] < level and bar["close"] >= level:
+                    level = float(bar["low"])
                 continue
 
             if confirmation_index < latest:
