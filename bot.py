@@ -187,17 +187,27 @@ def scan_momentum_breakout_candidate(broker, symbol, m5_bars, side, volatility):
     box_low = min(b["low"] for b in prior_box)
     close_buffer = CFG.BOS_BUFFER_ATR * ref_atr
 
+    prev_three = m5_bars[-4:-1]
+    if buy and all(b["close"] > b["open"] for b in prev_three):
+        prior_run = latest["open"] - prev_three[0]["open"]
+        if prior_run >= ref_atr * 1.8:
+            return None
+    elif not buy and all(b["close"] < b["open"] for b in prev_three):
+        prior_run = prev_three[0]["open"] - latest["open"]
+        if prior_run >= ref_atr * 1.8:
+            return None
+
     is_breakout = False
     extreme = None
 
     if buy and latest["close"] > box_high + close_buffer and latest["close"] > latest["open"]:
         is_breakout = True
-        swing_low = min(b["low"] for b in m5_bars[-4:])
-        extreme = max(swing_low, latest["close"] - (ref_atr * 2.5))
+        swing_low = min(b["low"] for b in m5_bars[-10:])
+        extreme = max(swing_low, latest["close"] - (ref_atr * 3.5))
     elif not buy and latest["close"] < box_low - close_buffer and latest["close"] < latest["open"]:
         is_breakout = True
-        swing_high = max(b["high"] for b in m5_bars[-4:])
-        extreme = min(swing_high, latest["close"] + (ref_atr * 2.5))
+        swing_high = max(b["high"] for b in m5_bars[-10:])
+        extreme = min(swing_high, latest["close"] + (ref_atr * 3.5))
 
     if not is_breakout or extreme is None:
         return None
