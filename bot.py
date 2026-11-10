@@ -76,22 +76,28 @@ class TelegramLogHandler(logging.Handler):
         except Exception:
             self.handleError(record)
 
+import threading
+
 def send_telegram_log_async(message):
     if not CFG.TELEGRAM_TOKEN or not CFG.TELEGRAM_CHAT_ID:
         return
-    try:
-        formatted_text = safe_text(message)
-        requests.post(
-            f"https://api.telegram.org/bot{CFG.TELEGRAM_TOKEN}/sendMessage",
-            json={
-                "chat_id": CFG.TELEGRAM_CHAT_ID,
-                "text": formatted_text,
-                "disable_web_page_preview": True,
-            },
-            timeout=5,
-        )
-    except Exception:
-        pass
+    formatted_text = safe_text(message)
+
+    def _worker():
+        try:
+            requests.post(
+                f"https://api.telegram.org/bot{CFG.TELEGRAM_TOKEN}/sendMessage",
+                json={
+                    "chat_id": CFG.TELEGRAM_CHAT_ID,
+                    "text": formatted_text,
+                    "disable_web_page_preview": True,
+                },
+                timeout=5,
+            )
+        except Exception:
+            pass
+
+    threading.Thread(target=_worker, daemon=True).start()
 
 ROOT = Path(__file__).resolve().parent
 load_dotenv(ROOT / ".env")
@@ -130,8 +136,8 @@ def analyze_order_flow(broker, symbol, side, reference_bar, bars=None):
     try:
         book = broker.read(f"mt5.market_book_get({symbol!r})")
         if book and isinstance(book, list) and len(book) > 0:
-            bid_volume_total = sum(float(item.get("volume", 0)) for item in book if item.get("type") == 1)
-            ask_volume_total = sum(float(item.get("volume", 0)) for item in book if item.get("type") == 2)
+            ask_volume_total = sum(float(item.get("volume", 0)) for item in book if item.get("type") == 1)
+            bid_volume_total = sum(float(item.get("volume", 0)) for item in book if item.get("type") == 2)
 
             if buy and bid_volume_total > ask_volume_total * 1.3:
                 flow_score += 1.5
@@ -406,30 +412,13 @@ def calculate_pdh_pdl(broker, symbol):
     daily_bars = broker.bars(
         symbol, broker.constant("TIMEFRAME_D1"), 3
     )
-    if not daily_bars or len(daily_bars) < 2:
+    if not daily_bars:
         return None, None
     
-    previous_day = daily_bars[-2]
+    previous_day = daily_bars[-1]
     pdh = previous_day["high"]
     pdl = previous_day["low"]
     return pdh, pdl
-
-
-def get_active_killzones_utc():
-    if not getattr(CFG, "USE_AUTO_DST_KILLZONES", True):
-        return list(CFG.KILLZONES_UTC)
-    try:
-        from zoneinfo import ZoneInfo
-        now_utc = utc_now()
-        london_hour = now_utc.astimezone(ZoneInfo("Europe/London")).hour
-        ny_hour = now_utc.astimezone(ZoneInfo("America/New_York")).hour
-        lon_start_utc = (now_utc.hour - (london_hour - 8)) % 24
-        lon_end_utc = (lon_start_utc + 3) % 24
-        ny_start_utc = (now_utc.hour - (ny_hour - 8)) % 24
-        ny_end_utc = (ny_start_utc + 4) % 24
-        return [(lon_start_utc, lon_end_utc), (ny_start_utc, ny_end_utc)]
-    except Exception:
-        return list(CFG.KILLZONES_UTC)
 
 
 def is_prime_killzone_utc():
@@ -1273,7 +1262,7 @@ def check_harmonic_bat_pattern(bars, side):
 
         return valid_b and valid_c and valid_d
 
-def calculate_scoring_logic(broker, bars, zone, sweep_bar, confirmation_bar, reference_atr, pdh=None, pdl=None):
+def calculate_scoring_logic(broker, bars, zone, sweep_bar, confirmation_bar, reference_atr, pdh=None, pdl=None, conf_idx=None):
     score = 0.0
 
     if zone.get("is_mitigation", False):
@@ -1298,7 +1287,8 @@ def calculate_scoring_logic(broker, bars, zone, sweep_bar, confirmation_bar, ref
             score += 1.0
 
     vol_ma = volume_ma(bars, CFG.VOLUME_MA_PERIOD)
-    conf_idx = bars.index(confirmation_bar) if confirmation_bar in bars else -1
+    if conf_idx is None:
+        conf_idx = bars.index(confirmation_bar) if confirmation_bar in bars else -1
     if conf_idx >= 0 and conf_idx < len(vol_ma):
         vm = vol_ma[conf_idx]
         if vm > 0 and confirmation_bar["volume"] >= vm * CFG.SWEEP_CONFIRM_VOLUME_MULTIPLIER:
@@ -1657,7 +1647,7 @@ def zone_signal(zone, bars, volatility, pdh=None, pdl=None, broker=None):
             if body < CFG.CONFIRM_MIN_BODY_ATR * reference:
                 conf_modifier -= 1.0
 
-            score = calculate_scoring_logic(broker, bars, zone, sweep_bar, bar, reference, pdh, pdl)
+            score = calculate_scoring_logic(broker, bars, zone, sweep_bar, bar, reference, pdh, pdl, conf_idx=confirmation_index)
             final_score = score + conf_modifier
 
             if final_score < CFG.MIN_SCORING_THRESHOLD:
@@ -2053,18 +2043,20 @@ def build_order(broker, candidate, account):
     buy = candidate["side"] == "BUY"
     tag = f"{symbol} {candidate['side']} [{candidate['zone']['kind']}]"
 
-    def reject(reason):
+    def reject(reason, permanent=True):
         status(f"reject_{symbol}", f"[REJECT] {tag}\nReason: {reason}", 60)
+        candidate["_permanent_reject"] = permanent
         return None
 
     allowed, reason = news_permission(broker, symbol)
     if not allowed:
-        return reject(f"News restriction ({reason})")
+        return reject(f"News restriction ({reason})", permanent=False)
 
     info = broker.info(symbol)
     tick = broker.tick(symbol)
 
     if tick_timestamp(tick) < candidate["signal_time"]:
+        candidate["_permanent_reject"] = False
         return None
 
     signal_age = time.time() - candidate["signal_time"]
@@ -2082,7 +2074,7 @@ def build_order(broker, candidate, account):
     spread_limit = base_spread_limit * (1.20 if is_prime_killzone_utc() else 1.0)
     current_spread = spread_points(tick, info)
     if current_spread > spread_limit:
-        return reject(f"Spread too high ({current_spread:.1f} pts > {spread_limit:.1f} pts)")
+        return reject(f"Spread too high ({current_spread:.1f} pts > {spread_limit:.1f} pts)", permanent=False)
 
     entry = float(tick["ask"] if buy else tick["bid"])
     volatility = float(candidate["atr"])
@@ -2092,7 +2084,7 @@ def build_order(broker, candidate, account):
     drift = abs(entry - candidate["signal_close"])
     max_drift = CFG.MAX_ENTRY_DRIFT_ATR * volatility
     if drift > max_drift:
-        return reject(f"Entry drift too high ({drift:.5f} > Max: {max_drift:.5f})")
+        return reject(f"Entry drift too high ({drift:.5f} > Max: {max_drift:.5f})", permanent=False)
 
     zone = candidate["zone"]
     buffer = CFG.SL_BUFFER_ATR * volatility
@@ -3508,8 +3500,9 @@ def main():
                         )
 
                         if built is None:
-                            state["seen_zones"][zone_id] = time.time()
-                            atomic_save(state_path, state)
+                            if candidate.get("_permanent_reject", True):
+                                state["seen_zones"][zone_id] = time.time()
+                                atomic_save(state_path, state)
                             continue
 
                         request, estimated_loss = built
