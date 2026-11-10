@@ -42,8 +42,10 @@ import hashlib
 import json
 import math
 import os
+import queue
 import re
 import sys
+import threading
 import time
 import uuid
 
@@ -67,6 +69,33 @@ def is_weekend():
     current_utc_time = datetime.now(timezone.utc)
     return current_utc_time.weekday() >= 5
 
+_TELEGRAM_QUEUE = queue.Queue(maxsize=500)
+
+
+def _telegram_worker():
+    while True:
+        message = _TELEGRAM_QUEUE.get()
+        if message is None:
+            break
+        try:
+            requests.post(
+                f"https://api.telegram.org/bot{CFG.TELEGRAM_TOKEN}/sendMessage",
+                json={
+                    "chat_id": CFG.TELEGRAM_CHAT_ID,
+                    "text": message,
+                    "disable_web_page_preview": True,
+                },
+                timeout=5,
+            )
+        except Exception:
+            pass
+        finally:
+            _TELEGRAM_QUEUE.task_done()
+
+
+threading.Thread(target=_telegram_worker, daemon=True).start()
+
+
 class TelegramLogHandler(logging.Handler):
     def emit(self, record):
         try:
@@ -76,28 +105,14 @@ class TelegramLogHandler(logging.Handler):
         except Exception:
             self.handleError(record)
 
-import threading
 
 def send_telegram_log_async(message):
     if not CFG.TELEGRAM_TOKEN or not CFG.TELEGRAM_CHAT_ID:
         return
-    formatted_text = safe_text(message)
-
-    def _worker():
-        try:
-            requests.post(
-                f"https://api.telegram.org/bot{CFG.TELEGRAM_TOKEN}/sendMessage",
-                json={
-                    "chat_id": CFG.TELEGRAM_CHAT_ID,
-                    "text": formatted_text,
-                    "disable_web_page_preview": True,
-                },
-                timeout=5,
-            )
-        except Exception:
-            pass
-
-    threading.Thread(target=_worker, daemon=True).start()
+    try:
+        _TELEGRAM_QUEUE.put_nowait(safe_text(message))
+    except queue.Full:
+        pass
 
 ROOT = Path(__file__).resolve().parent
 load_dotenv(ROOT / ".env")
@@ -107,6 +122,7 @@ SHARED_NEWS_FETCHER.start()
 
 LOCK_HANDLE = None
 LAST_STATUS = {}
+NOTIFIED_ZONES = set()
 
 
 class SafetyError(RuntimeError):
@@ -147,9 +163,7 @@ def analyze_order_flow(broker, symbol, side, reference_bar, bars=None):
         pass
 
     try:
-        if bars is None or len(bars) < 2:
-            pass
-        else:
+        if bars is not None and len(bars) >= 2:
             bar_volume = float(reference_bar.get("volume", 0))
             vol_ma_list = volume_ma(bars, CFG.VOLUME_MA_PERIOD)
             if vol_ma_list:
@@ -3348,12 +3362,10 @@ def main():
         notify(
             "SMC bot started.\n"
             f"Mode: {'DRY_RUN' if CFG.DRY_RUN else 'LIVE'}\n"
-            "Account type: Hedging\n"
-            "Time basis: UTC\n"
-            f"OB/FVG confluence: {CFG.REQUIRE_OB_FVG_CONFLUENCE}\n"
-            f"M15 confirmation: {CFG.REQUIRE_M15_CONFIRMATION}\n"
-            f"News filter: {CFG.ENABLE_NEWS_FILTER}\n"
-            f"Time exit: {CFG.ENABLE_TIME_EXIT}"
+            f"Balance: ${float(account.get('balance', 0.0)):.2f} | Dynamic risk: {getattr(CFG, 'USE_DYNAMIC_RISK', True)} ({getattr(CFG, 'RISK_PCT', 3.0):.1f}%)\n"
+            f"Dynamic daily quota: {getattr(CFG, 'USE_DYNAMIC_DAILY_TRADES', True)} (Base: {CFG.MAX_DAILY_TRADES})\n"
+            f"Dynamic TP scaling: {getattr(CFG, 'USE_DYNAMIC_TP_SCALING', True)} | Dynamic time exit: {getattr(CFG, 'USE_DYNAMIC_TIME_EXIT', True)}\n"
+            f"Auto-DST London/NY session: {getattr(CFG, 'USE_AUTO_DST_KILLZONES', True)} | News filter: {CFG.ENABLE_NEWS_FILTER}"
         )
 
         if CFG.COMMISSION_PER_LOT == 0:
@@ -3455,16 +3467,14 @@ def main():
                 if all_candidates:
                     all_candidates.sort(key=lambda x: x["score"], reverse=True)
 
-                    notified_set = getattr(main, "_notified_zones", set())
-                    new_for_notify = [c for c in all_candidates[:5] if c["zone_id"] not in notified_set]
+                    new_for_notify = [c for c in all_candidates[:5] if c["zone_id"] not in NOTIFIED_ZONES]
                     if new_for_notify:
                         top_signal_text = "Top Ranked Signals:\n"
                         for c in new_for_notify:
                             top_signal_text += f"- {c['symbol']} ({c['side']}) [{c['zone']['kind']}] | Score: {c['score']:.2f}\n"
-                            notified_set.add(c["zone_id"])
-                        if len(notified_set) > 500:
-                            notified_set.clear()
-                        main._notified_zones = notified_set
+                            NOTIFIED_ZONES.add(c["zone_id"])
+                        if len(NOTIFIED_ZONES) > 500:
+                            NOTIFIED_ZONES.clear()
                         notify(top_signal_text)
 
                     for candidate in all_candidates:
