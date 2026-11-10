@@ -201,7 +201,7 @@ class NewsFetcher:
         out = []
         for item in data:
             impact = item.get("impact")
-            if impact not in CFG.NEWS_IMPACTS_TRACKED and impact != "Medium":
+            if impact not in CFG.NEWS_IMPACTS_TRACKED:
                 continue
 
             time_str = item.get("date")

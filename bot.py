@@ -14,8 +14,8 @@ Signal rules:
 - Zone age and touch timeout limits.
 
 Execution rules:
-- Dry-run by default.
-- Live mode additionally requires ALLOW_LIVE_TRADING=true.
+- Live execution enabled by default for dedicated Demo/VPS deployment (set DRY_RUN=true in .env to disable).
+- Live mode requires ALLOW_LIVE_TRADING=true.
 - Hedging accounts only.
 - One position or active order per symbol, regardless of magic.
 - Durable execution journal before every trading request.
@@ -93,7 +93,8 @@ def _telegram_worker():
             _TELEGRAM_QUEUE.task_done()
 
 
-threading.Thread(target=_telegram_worker, daemon=True).start()
+if CFG.TELEGRAM_TOKEN and CFG.TELEGRAM_CHAT_ID:
+    threading.Thread(target=_telegram_worker, daemon=True).start()
 
 
 class TelegramLogHandler(logging.Handler):
@@ -3349,7 +3350,7 @@ def main():
         notify(
             "SMC bot started.\n"
             f"Mode: {'DRY_RUN' if CFG.DRY_RUN else 'LIVE'}\n"
-            f"Balance: ${float(account.get('balance', 0.0)):.2f} | Dynamic risk: {getattr(CFG, 'USE_DYNAMIC_RISK', True)} ({getattr(CFG, 'RISK_PCT', 3.0):.1f}%)\n"
+            f"Balance: {float(account.get('balance', 0.0)):.2f} {account.get('currency', 'USD')} | Dynamic risk: {getattr(CFG, 'USE_DYNAMIC_RISK', True)} ({getattr(CFG, 'RISK_PCT', 3.0):.1f}%)\n"
             f"Dynamic daily quota: {getattr(CFG, 'USE_DYNAMIC_DAILY_TRADES', True)} (Base: {CFG.MAX_DAILY_TRADES})\n"
             f"Dynamic TP scaling: {getattr(CFG, 'USE_DYNAMIC_TP_SCALING', True)} | Dynamic time exit: {getattr(CFG, 'USE_DYNAMIC_TIME_EXIT', True)}\n"
             f"Auto-DST London/NY session: {getattr(CFG, 'USE_AUTO_DST_KILLZONES', True)} | News filter: {CFG.ENABLE_NEWS_FILTER}"
@@ -3393,8 +3394,9 @@ def main():
                 if state["halt_reason"]:
                     status(
                         "persistent_halt",
-                        "A persistent safety halt is active. "
-                        "No automatic trading requests will be sent.",
+                        f"A persistent safety halt is active ({state['halt_reason']}). "
+                        f"Clear 'halt_reason' in {state_path.name} after checking MT5.",
+                        1800,
                     )
                     time.sleep(CFG.POLL_SECONDS)
                     continue
