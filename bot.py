@@ -414,6 +414,44 @@ def calculate_pdh_pdl(broker, symbol):
     pdl = previous_day["low"]
     return pdh, pdl
 
+
+def is_prime_killzone_utc():
+    hour = utc_now().hour
+    for start_k, end_k in CFG.KILLZONES_UTC:
+        if start_k <= hour < end_k:
+            return True
+    return False
+
+
+def currency_exposure_ok(symbol, side, active_positions):
+    max_per_cur = int(getattr(CFG, "MAX_POSITIONS_PER_CURRENCY", 2))
+    if max_per_cur <= 0 or not active_positions:
+        return True
+
+    base_c, quote_c, _ = SHARED_NEWS_FETCHER.map_symbol_currencies(symbol)
+    new_dir = {}
+    if base_c and base_c != "IDX":
+        new_dir[base_c] = 1 if side == "BUY" else -1
+    if quote_c:
+        new_dir[quote_c] = -1 if side == "BUY" else 1
+
+    exposure_counts = {}
+    for pos in active_positions:
+        p_sym = pos.get("symbol", "")
+        p_buy = int(pos.get("type", 0)) == 0
+        b_c, q_c, _ = SHARED_NEWS_FETCHER.map_symbol_currencies(p_sym)
+        if b_c and b_c != "IDX":
+            d = 1 if p_buy else -1
+            exposure_counts[(b_c, d)] = exposure_counts.get((b_c, d), 0) + 1
+        if q_c:
+            d = -1 if p_buy else 1
+            exposure_counts[(q_c, d)] = exposure_counts.get((q_c, d), 0) + 1
+
+    for cur, d in new_dir.items():
+        if exposure_counts.get((cur, d), 0) >= max_per_cur:
+            return False
+    return True
+
 def status(key, message, interval=300):
     now = time.time()
     if now - LAST_STATUS.get(key, 0.0) >= interval:
@@ -1011,9 +1049,6 @@ def atr(bars, period=14):
 
 
 def swings(bars, window):
-    """
-    A swing is available only after all right confirmation bars close.
-    """
     highs = []
     lows = []
 
@@ -1048,21 +1083,32 @@ def htf_bias(bars):
     if len(highs) < 2 or len(lows) < 2:
         return "NEUTRAL"
 
-    close = bars[-1]["close"]
-    average = ema(
-        [bar["close"] for bar in bars], CFG.BIAS_EMA_PERIOD
-    )[-1]
+    closes = [bar["close"] for bar in bars]
+    close = closes[-1]
+    ema50 = ema(closes, 50)[-1]
+    ema200 = ema(closes, CFG.BIAS_EMA_PERIOD)[-1]
 
-    bullish = (
+    bullish_swings = (
         highs[-1]["price"] > highs[-2]["price"]
         and lows[-1]["price"] > lows[-2]["price"]
     )
-    bearish = (
+    bearish_swings = (
         highs[-1]["price"] < highs[-2]["price"]
         and lows[-1]["price"] < lows[-2]["price"]
     )
 
-    if bullish and close > average:
+    fresh_bull_bos = (
+        close > highs[-1]["price"]
+        and lows[-1]["price"] >= lows[-2]["price"]
+        and ema50 > ema200
+    )
+    fresh_bear_bos = (
+        close < lows[-1]["price"]
+        and highs[-1]["price"] <= highs[-2]["price"]
+        and ema50 < ema200
+    )
+
+    if (bullish_swings or fresh_bull_bos) and close > ema200:
         pivot = lows[-1]
         broken = any(
             bar["close"] < pivot["price"]
@@ -1071,7 +1117,7 @@ def htf_bias(bars):
         if not broken:
             return "BUY"
 
-    if bearish and close < average:
+    if (bearish_swings or fresh_bear_bos) and close < ema200:
         pivot = highs[-1]
         broken = any(
             bar["close"] > pivot["price"]
@@ -1333,6 +1379,19 @@ def create_zones(symbol, bars, side):
 
             if not (pd_zone_bottom <= midpoint <= pd_zone_top):
                 return
+
+            subsequent_m15 = bars[final_index + 1 : -2] if final_index + 1 < len(bars) - 2 else []
+            for m_bar in subsequent_m15:
+                if buy:
+                    if m_bar["close"] < bottom:
+                        return
+                    if m_bar["low"] <= midpoint:
+                        return
+                else:
+                    if m_bar["close"] > top:
+                        return
+                    if m_bar["high"] >= midpoint:
+                        return
 
             key = f"{side}:{kind}:{bars[source_index]['time']}:{created}"
             result.append({
@@ -1759,6 +1818,9 @@ def scan_symbol(broker, symbol, state):
                     score_boost += 1.5
             except Exception:
                 pass
+
+        if is_prime_killzone_utc():
+            score_boost += 0.75
 
         candidate["score"] = candidate.get("score", 6.0) + score_boost
 
@@ -2949,7 +3011,26 @@ def manage_positions(broker, state, path):
                 "Stop management remains enabled."
             )
 
+        be_trigger_r = float(getattr(CFG, "BREAKEVEN_TRIGGER_RR", 1.0))
+        be_lock_r = float(getattr(CFG, "BREAKEVEN_LOCK_RR", 0.10))
         if not record["partial_done"]:
+            if current_r >= be_trigger_r:
+                be_sl = (
+                    entry + (be_lock_r * initial_risk)
+                    if buy
+                    else entry - (be_lock_r * initial_risk)
+                )
+                be_req = stop_request(broker, pid, be_sl)
+                if be_req is not None:
+                    execute_request(
+                        broker,
+                        state,
+                        path,
+                        "MODIFY_SL",
+                        be_req,
+                        {"position_id": pid},
+                    )
+                    return
             continue
 
         bars = broker.bars(
@@ -2972,21 +3053,29 @@ def manage_positions(broker, state, path):
 
         highs, lows = swings(bars, CFG.LTF_SWING_WINDOW)
         buffer = CFG.SL_BUFFER_ATR * volatility
-        desired_sl = None
+        be_floor = (
+            entry + (be_lock_r * initial_risk)
+            if buy
+            else entry - (be_lock_r * initial_risk)
+        )
+        desired_sl = be_floor
 
         if buy:
             valid_lows = [l["price"] for l in lows if l["price"] < price]
             if valid_lows:
                 structural_sl = valid_lows[-1] - buffer
-                desired_sl = max(entry, structural_sl)
+                desired_sl = max(desired_sl, structural_sl)
+            atr_trail = price - (CFG.TRAIL_ATR * volatility)
+            if atr_trail > entry:
+                desired_sl = max(desired_sl, atr_trail)
         else:
             valid_highs = [h["price"] for h in highs if h["price"] > price]
             if valid_highs:
                 structural_sl = valid_highs[-1] + buffer
-                desired_sl = min(entry, structural_sl)
-
-        if desired_sl is None:
-            continue
+                desired_sl = min(desired_sl, structural_sl)
+            atr_trail = price + (CFG.TRAIL_ATR * volatility)
+            if atr_trail < entry:
+                desired_sl = min(desired_sl, atr_trail)
 
         request = stop_request(broker, pid, desired_sl)
 
@@ -3169,49 +3258,46 @@ def main():
 
                 all_candidates = []
 
-                for symbol in CFG.SYMBOLS:
-                    print(f"--- [SCANNING] Checking symbol: {symbol} ---", flush=True)
+                snapshot = daily_snapshot(broker, state, state_path)
+                positions = broker.positions()
+                orders = broker.orders()
+                permitted, reason = entry_permission(
+                    broker, state, snapshot, positions, orders
+                )
 
-                    snapshot = daily_snapshot(
-                        broker, state, state_path
-                    )
-                    positions = broker.positions()
-                    orders = broker.orders()
+                if not permitted:
+                    status("entry_gate", reason)
+                else:
+                    active_symbols = {item["symbol"] for item in positions + orders}
+                    news_blocked_symbols = []
 
-                    permitted, reason = entry_permission(
-                        broker, state, snapshot, positions, orders
-                    )
+                    for symbol in CFG.SYMBOLS:
+                        if symbol in active_symbols:
+                            continue
 
-                    if not permitted:
-                        status("entry_gate", reason)
-                        continue
+                        news_ok, news_reason = news_permission(broker, symbol)
+                        if not news_ok:
+                            news_blocked_symbols.append(symbol)
+                            continue
 
-                    if any(
-                        item["symbol"] == symbol
-                        for item in positions + orders
-                    ):
-                        continue
+                        print(f"--- [SCANNING] Checking symbol: {symbol} ---", flush=True)
+                        candidate = scan_symbol(broker, symbol, state)
 
-                    news_ok, news_reason = news_permission(
-                        broker, symbol
-                    )
+                        if candidate is not None:
+                            if not currency_exposure_ok(symbol, candidate["side"], positions):
+                                continue
+                            zone_id = candidate["zone_id"]
+                            if zone_id not in state["seen_zones"]:
+                                all_candidates.append(candidate)
 
-                    if not news_ok:
+                    if news_blocked_symbols:
                         status(
-                            f"news_{symbol}",
-                            f"{symbol}: {news_reason}",
-                            60,
+                            "news_blackout_summary",
+                            f"News blackout active for {len(news_blocked_symbols)} symbol(s): "
+                            + ", ".join(news_blocked_symbols[:8])
+                            + ("..." if len(news_blocked_symbols) > 8 else ""),
+                            900,
                         )
-                        continue
-
-                    candidate = scan_symbol(
-                        broker, symbol, state
-                    )
-
-                    if candidate is not None:
-                        zone_id = candidate["zone_id"]
-                        if zone_id not in state["seen_zones"]:
-                            all_candidates.append(candidate)
 
                 if all_candidates:
                     all_candidates.sort(key=lambda x: x["score"], reverse=True)
@@ -3254,6 +3340,9 @@ def main():
                             item["symbol"] == symbol
                             for item in fresh_positions + fresh_orders
                         ):
+                            continue
+
+                        if not currency_exposure_ok(symbol, candidate["side"], fresh_positions):
                             continue
 
                         bot_positions = [

@@ -273,7 +273,7 @@ class NewsFetcher:
 
                 minutes_until = (news["time"] - now).total_seconds() / 60.0
                 if -after_window <= minutes_until <= before_window:
-                    log.info(
+                    log.debug(
                         "RESTRICTED | %s | [%s] %s (%s) @ %s UTC (Δ%.1fmin)",
                         symbol, news["impact"], news["title"], news["currency"],
                         news["time"].strftime("%H:%M"), minutes_until,
