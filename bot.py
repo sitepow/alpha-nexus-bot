@@ -1105,9 +1105,9 @@ def calculate_scoring_logic(broker, bars, zone, sweep_bar, confirmation_bar, ref
     if bar_range > 0:
         buy = zone["side"] == "BUY"
         wick_ratio = (
-            (sweep_bar["high"] - sweep_bar["close"]) / bar_range
+            (min(sweep_bar["open"], sweep_bar["close"]) - sweep_bar["low"]) / bar_range
             if buy
-            else (sweep_bar["close"] - sweep_bar["low"]) / bar_range
+            else (sweep_bar["high"] - max(sweep_bar["open"], sweep_bar["close"])) / bar_range
         )
         if wick_ratio >= 0.40:
             score += 2.5
@@ -1253,10 +1253,10 @@ def zone_signal(zone, bars, volatility, pdh=None, pdl=None, broker=None):
     latest = len(bars) - 1
     decision_time = bars[-1]["time"] + 300
 
-    signal_score_modifier = 0.0
+    base_score_modifier = 0.0
 
     if decision_time - zone["created"] > CFG.MAX_ZONE_AGE_M15_BARS * 900:
-        signal_score_modifier -= 2.0
+        base_score_modifier -= 2.0
 
     buy = zone["side"] == "BUY"
     eligible = [index for index, bar in enumerate(bars) if bar["time"] >= zone["created"]]
@@ -1275,13 +1275,13 @@ def zone_signal(zone, bars, volatility, pdh=None, pdl=None, broker=None):
         return None
 
     if latest - touch > CFG.MAX_TOUCH_WAIT_BARS:
-        signal_score_modifier -= 1.5
+        base_score_modifier -= 1.5
 
-    for bar in bars[touch:]:
-        if buy and bar["close"] < zone["bottom"]:
-            signal_score_modifier -= 3.0
-        if not buy and bar["close"] > zone["top"]:
-            signal_score_modifier -= 3.0
+    if any(
+        (bar["close"] < zone["bottom"] if buy else bar["close"] > zone["top"])
+        for bar in bars[touch:]
+    ):
+        base_score_modifier -= 3.0
 
     sweep_end = min(touch + CFG.SWEEP_AFTER_TOUCH_BARS, latest - 1)
 
@@ -1296,34 +1296,29 @@ def zone_signal(zone, bars, volatility, pdh=None, pdl=None, broker=None):
         if reference_atr <= 0:
             continue
 
-        bar_range = sweep_bar["high"] - sweep_bar["low"]
-        if bar_range > 0:
-            wick_ratio = (
-                (sweep_bar["high"] - sweep_bar["close"]) / bar_range
-                if buy
-                else (sweep_bar["close"] - sweep_bar["low"]) / bar_range
-            )
-            if wick_ratio > CFG.MAX_SWEEP_WICK_RATIO:
-                signal_score_modifier -= 1.0
-
         overlaps = sweep_bar["low"] <= zone["top"] and sweep_bar["high"] >= zone["bottom"]
         if not overlaps:
             continue
+
+        sweep_modifier = base_score_modifier
+
+        if not wick_rejection_ok(sweep_bar, zone["side"], CFG.MAX_SWEEP_WICK_RATIO):
+            sweep_modifier -= 1.0
 
         if buy:
             counter_structure = highs[-1]["price"] < highs[-2]["price"] and lows[-1]["price"] < lows[-2]["price"]
             liquidity = lows[-1]
             confirmation = highs[-1]
         else:
-            counter_structure = highs[-1]["price"] > highs[-2]["price"] and lows[-1]["price"] < lows[-2]["price"]
+            counter_structure = highs[-1]["price"] > highs[-2]["price"] and lows[-1]["price"] > lows[-2]["price"]
             liquidity = highs[-1]
             confirmation = lows[-1]
 
         if not counter_structure:
-            signal_score_modifier -= 1.5
+            sweep_modifier -= 1.5
 
         if sweep_index - liquidity["index"] > CFG.LIQUIDITY_MAX_AGE:
-            signal_score_modifier -= 1.0
+            sweep_modifier -= 1.0
 
         intervening = bars[liquidity["confirmed_index"] + 1:sweep_index]
         already_taken = any(
@@ -1331,7 +1326,7 @@ def zone_signal(zone, bars, volatility, pdh=None, pdl=None, broker=None):
             for bar in intervening
         )
         if already_taken:
-            signal_score_modifier -= 1.5
+            sweep_modifier -= 1.5
 
         dynamic_sweep_min = get_dynamic_sweep_atr(zone["symbol"] if "symbol" in zone else "EURUSD", reference_atr)
 
@@ -1347,7 +1342,7 @@ def zone_signal(zone, bars, volatility, pdh=None, pdl=None, broker=None):
             )
 
         if not swept:
-            signal_score_modifier -= 1.0
+            sweep_modifier -= 1.0
 
         level = confirmation["price"]
         confirmation_end = min(sweep_index + CFG.CONFIRM_AFTER_SWEEP_BARS, latest)
@@ -1356,9 +1351,9 @@ def zone_signal(zone, bars, volatility, pdh=None, pdl=None, broker=None):
             bar = bars[confirmation_index]
             raw_break = bar["close"] > level if buy else bar["close"] < level
             if not raw_break:
-                signal_score_modifier -= 0.5
                 continue
 
+            conf_modifier = sweep_modifier
             reference = volatility[confirmation_index - 1]
             close_buffer = CFG.CONFIRM_CLOSE_BUFFER_ATR * reference
             body = abs(bar["close"] - bar["open"])
@@ -1370,12 +1365,12 @@ def zone_signal(zone, bars, volatility, pdh=None, pdl=None, broker=None):
             )
 
             if not strong_close:
-                signal_score_modifier -= 1.0
+                conf_modifier -= 1.0
             if body < CFG.CONFIRM_MIN_BODY_ATR * reference:
-                signal_score_modifier -= 1.0
+                conf_modifier -= 1.0
 
             score = calculate_scoring_logic(broker, bars, zone, sweep_bar, bar, reference, pdh, pdl)
-            final_score = score + signal_score_modifier
+            final_score = score + conf_modifier
 
             if final_score < CFG.MIN_SCORING_THRESHOLD:
                 break
@@ -3020,8 +3015,6 @@ def main():
                         zone_id = candidate["zone_id"]
                         if zone_id not in state["seen_zones"]:
                             all_candidates.append(candidate)
-                            state["seen_zones"][zone_id] = time.time()
-                            atomic_save(state_path, state)
 
                 if all_candidates:
                     all_candidates.sort(key=lambda x: x["score"], reverse=True)
@@ -3113,7 +3106,7 @@ def main():
                                     pass
                             continue
 
-                        execute_request(
+                        submitted = execute_request(
                             broker,
                             state,
                             state_path,
@@ -3126,6 +3119,8 @@ def main():
                                 "signal_time": candidate["signal_time"],
                             },
                         )
+                        if submitted:
+                            break
 
                 time.sleep(CFG.POLL_SECONDS)
 
