@@ -1602,8 +1602,8 @@ def get_news_sentiment_score(symbol, side, m5_bars=None):
                     if ref_range > 0 and abs(net_move) >= ref_range * 1.2:
                         favorable_side = "BUY" if net_move > 0 else "SELL"
 
-            boost_val = float(getattr(CFG, "NEWS_SCORE_BOOST_HIGH", 3.0) if impact == "High" else getattr(CFG, "NEWS_SCORE_BOOST_MED", 1.5))
-            penalty_val = float(CFG.NEWS_HIGH_IMPACT_PENALTY if impact == "High" else CFG.NEWS_MEDIUM_IMPACT_PENALTY)
+            boost_val = getattr(CFG, "NEWS_SCORE_BOOST_HIGH", 3.0) if impact == "High" else getattr(CFG, "NEWS_SCORE_BOOST_MED", 1.5)
+            penalty_val = CFG.NEWS_HIGH_IMPACT_PENALTY if impact == "High" else CFG.NEWS_MEDIUM_IMPACT_PENALTY
 
             if favorable_side == side:
                 sentiment_score += boost_val
