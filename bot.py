@@ -278,15 +278,19 @@ def detect_market_regime(h4_bars):
     closes = [bar["close"] for bar in h4_bars]
     ema_fast = ema(closes, 50)
     ema_slow = ema(closes, 200)
+    h4_volatility = atr(h4_bars)
+    ref_h4_atr = h4_volatility[-1] if h4_volatility and h4_volatility[-1] > 0 else (ema_slow[-1] * 0.002)
 
-    trend_aligned = abs(ema_fast[-1] - ema_slow[-1]) > (ema_slow[-1] * 0.01)
+    ema_gap = abs(ema_fast[-1] - ema_slow[-1])
+    trend_aligned = ema_gap >= (ref_h4_atr * 0.35)
 
     highs, lows = swings(h4_bars, CFG.HTF_SWING_WINDOW)
     if len(highs) >= 2 and len(lows) >= 2:
         recent_range_span = abs(highs[-1]["price"] - lows[-1]["price"])
-        avg_span = sum(h["price"] - l["price"] for h, l in zip(highs[-5:], lows[-5:])) / min(5, len(highs))
-        
-        if trend_aligned and recent_range_span > avg_span * 1.3:
+        span_count = min(5, len(highs), len(lows))
+        avg_span = sum(abs(h["price"] - l["price"]) for h, l in zip(highs[-span_count:], lows[-span_count:])) / span_count
+
+        if ema_gap >= (ref_h4_atr * 0.80) and recent_range_span > avg_span * 1.25:
             return "STRONG_TREND"
 
     if not trend_aligned:
@@ -317,11 +321,13 @@ def notify(message):
     log(message)
 
 def get_dynamic_sweep_atr(symbol, base_atr):
+    if base_atr <= 0:
+        return 0.0
     if not symbol:
-        return base_atr * 0.10
-        
+        return base_atr * getattr(CFG, "SWEEP_MIN_ATR", 0.10)
+
     symbol_upper = symbol.upper()
-    
+
     if any(k in symbol_upper for k in ["XAU", "XPT", "XPD", "BTC", "ETH", "SOL", "BNB", "AVAX"]):
         multiplier = 0.12
     elif any(k in symbol_upper for k in ["30", "TEC", "500", "DE30", "FR40", "UK100", "JP225", "HK50", "AU200", "OIL", "XNG", "XCU"]):
@@ -330,8 +336,8 @@ def get_dynamic_sweep_atr(symbol, base_atr):
         multiplier = 0.15
     else:
         multiplier = 0.10
-        
-    return max(0.08, base_atr * multiplier)
+
+    return base_atr * multiplier
 
 def check_trendline_liquidity_sweep(bars, zone_side):
     highs, lows = swings(bars, 2)
@@ -1171,12 +1177,22 @@ def create_zones(symbol, bars, side):
         candle_range = impulse["high"] - impulse["low"]
         directional = impulse["close"] > impulse["open"] if buy else impulse["close"] < impulse["open"]
 
-        if not directional or candle_range <= 0 or body < CFG.DISPLACEMENT_ATR * reference_atr:
+        if (
+            not directional
+            or candle_range <= 0
+            or body < CFG.DISPLACEMENT_ATR * reference_atr
+            or (body / candle_range) < CFG.DISPLACEMENT_BODY_RATIO
+        ):
             continue
 
         pivot = first_structure_break(bars, impulse_index, side, reference_atr)
         if pivot is None:
             continue
+
+        fvg_bottom = right["high"] if not buy else left["high"]
+        fvg_top = left["low"] if not buy else right["low"]
+        fvg_size = (fvg_top - fvg_bottom) if buy else (fvg_top - fvg_bottom)
+        has_fvg = fvg_size >= (CFG.MIN_FVG_ATR * reference_atr)
 
         ob_index = None
         for source in range(impulse_index - 1, max(-1, impulse_index - CFG.OB_SEARCH_BACK - 1), -1):
@@ -1186,7 +1202,7 @@ def create_zones(symbol, bars, side):
                 ob_index = source
                 break
 
-        dealing = bars[impulse_index - CFG.DEALING_RANGE_BARS:impulse_index]
+        dealing = bars[impulse_index - CFG.DEALING_RANGE_BARS:impulse_index + 1]
         range_high = max(bar["high"] for bar in dealing)
         range_low = min(bar["low"] for bar in dealing)
         width = range_high - range_low
@@ -1194,28 +1210,26 @@ def create_zones(symbol, bars, side):
         if width <= 0:
             continue
 
-        if buy:
-            fibo_zone_top = range_high - (width * 0.618)
-            fibo_zone_bottom = range_high - (width * 0.786)
-        else:
-            fibo_zone_bottom = range_low + (width * 0.618)
-            fibo_zone_top = range_low + (width * 0.786)
-
+        eq_buffer = width * CFG.PD_EQUILIBRIUM_BUFFER
         equilibrium = (range_high + range_low) / 2.0
+
+        if buy:
+            pd_zone_top = equilibrium - eq_buffer
+            pd_zone_bottom = range_low - (reference_atr * 0.5)
+        else:
+            pd_zone_bottom = equilibrium + eq_buffer
+            pd_zone_top = range_high + (reference_atr * 0.5)
+
         created = int(right["time"] + 900)
 
-        def add_zone(kind, bottom, top, source_index, is_mitigation=False):
+        def add_zone(kind, bottom, top, source_index, is_mitigation=False, confluence=False):
             if bottom >= top:
                 return
-            
+
             midpoint = (bottom + top) / 2.0
 
-            if buy:
-                if not (fibo_zone_bottom <= midpoint <= fibo_zone_top):
-                    return
-            else:
-                if not (fibo_zone_bottom <= midpoint <= fibo_zone_top):
-                    return
+            if not (pd_zone_bottom <= midpoint <= pd_zone_top):
+                return
 
             key = f"{side}:{kind}:{bars[source_index]['time']}:{created}"
             result.append({
@@ -1230,10 +1244,10 @@ def create_zones(symbol, bars, side):
                 "equilibrium": float(equilibrium),
                 "bos_level": float(pivot["price"]),
                 "is_mitigation": bool(is_mitigation),
-                "confluence": True,
+                "confluence": bool(confluence),
             })
 
-        if CFG.ENABLE_MITIGATION_BLOCK and ob_index is not None:
+        if ob_index is not None:
             source_bar = bars[ob_index]
             path_after_ob = bars[ob_index + 1 : impulse_index]
             broken_ob = False
@@ -1244,11 +1258,35 @@ def create_zones(symbol, bars, side):
                 elif not buy and b["high"] > source_bar["high"]:
                     broken_ob = True
                     break
-            
-            if broken_ob:
-                add_zone("MITIGATION_BLOCK", source_bar["low"], source_bar["high"], ob_index, is_mitigation=True)
-            else:
-                add_zone("OB", source_bar["low"], source_bar["high"], ob_index, is_mitigation=False)
+
+            if broken_ob and CFG.ENABLE_MITIGATION_BLOCK:
+                add_zone(
+                    "MITIGATION_BLOCK",
+                    source_bar["low"],
+                    source_bar["high"],
+                    ob_index,
+                    is_mitigation=True,
+                    confluence=has_fvg,
+                )
+            elif not broken_ob:
+                add_zone(
+                    "OB",
+                    source_bar["low"],
+                    source_bar["high"],
+                    ob_index,
+                    is_mitigation=False,
+                    confluence=has_fvg,
+                )
+
+        if has_fvg:
+            add_zone(
+                "FVG",
+                fvg_bottom,
+                fvg_top,
+                impulse_index,
+                is_mitigation=False,
+                confluence=(ob_index is not None),
+            )
 
     unique = {zone["local_id"]: zone for zone in result}
     return sorted(unique.values(), key=lambda zone: zone["created"], reverse=True)
@@ -1284,11 +1322,12 @@ def zone_signal(zone, bars, volatility, pdh=None, pdl=None, broker=None):
     if latest - touch > CFG.MAX_TOUCH_WAIT_BARS:
         base_score_modifier -= 1.5
 
+    invalidation_buffer = volatility[touch] * 0.15 if volatility[touch] > 0 else 0.0
     if any(
-        (bar["close"] < zone["bottom"] if buy else bar["close"] > zone["top"])
+        (bar["close"] < zone["bottom"] - invalidation_buffer if buy else bar["close"] > zone["top"] + invalidation_buffer)
         for bar in bars[touch:]
     ):
-        base_score_modifier -= 3.0
+        return None
 
     sweep_end = min(touch + CFG.SWEEP_AFTER_TOUCH_BARS, latest - 1)
 
@@ -1339,17 +1378,27 @@ def zone_signal(zone, bars, volatility, pdh=None, pdl=None, broker=None):
 
         if buy:
             swept = (
-                sweep_bar["low"] < liquidity["price"] - dynamic_sweep_min
+                sweep_bar["low"] <= liquidity["price"] - dynamic_sweep_min
                 and sweep_bar["close"] > liquidity["price"]
+            )
+            zone_mitigated = (
+                sweep_bar["low"] <= zone["top"]
+                and sweep_bar["close"] >= zone["bottom"]
             )
         else:
             swept = (
-                sweep_bar["high"] > liquidity["price"] + dynamic_sweep_min
+                sweep_bar["high"] >= liquidity["price"] + dynamic_sweep_min
                 and sweep_bar["close"] < liquidity["price"]
+            )
+            zone_mitigated = (
+                sweep_bar["high"] >= zone["bottom"]
+                and sweep_bar["close"] <= zone["top"]
             )
 
         if not swept:
-            sweep_modifier -= 1.0
+            if not zone_mitigated:
+                continue
+            sweep_modifier -= 1.5
 
         level = confirmation["price"]
         confirmation_end = min(sweep_index + CFG.CONFIRM_AFTER_SWEEP_BARS, latest)
@@ -1359,6 +1408,9 @@ def zone_signal(zone, bars, volatility, pdh=None, pdl=None, broker=None):
             raw_break = bar["close"] > level if buy else bar["close"] < level
             if not raw_break:
                 continue
+
+            if confirmation_index < latest:
+                break
 
             conf_modifier = sweep_modifier
             reference = volatility[confirmation_index - 1]
