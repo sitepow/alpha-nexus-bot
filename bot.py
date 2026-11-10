@@ -1874,6 +1874,41 @@ def scan_symbol(broker, symbol, state):
     chosen["symbol"] = symbol
     return chosen
 
+def dynamic_risk_budget(account, score=6.0):
+    balance = float(account.get("balance", 0.0))
+    equity = float(account.get("equity", balance))
+    effective_capital = min(balance, equity) if (balance > 0 and equity > 0) else max(balance, equity)
+
+    if not getattr(CFG, "USE_DYNAMIC_RISK", True) or effective_capital <= 0:
+        return float(CFG.RISK_PER_TRADE)
+
+    base_pct = float(getattr(CFG, "RISK_PCT", 3.0))
+    if effective_capital >= 10000.0:
+        tier_pct = min(base_pct, 1.5)
+    elif effective_capital >= 3000.0:
+        tier_pct = min(base_pct, 2.0)
+    elif effective_capital >= 1000.0:
+        tier_pct = min(base_pct, 2.5)
+    else:
+        tier_pct = base_pct
+
+    conviction_mult = 1.0 if score >= 9.5 else (0.92 if score >= 7.5 else 0.85)
+    raw_budget = effective_capital * (tier_pct / 100.0) * conviction_mult
+    return max(0.50, raw_budget)
+
+
+def dynamic_max_open_positions(account):
+    base_max = int(CFG.MAX_OPEN_POSITIONS)
+    balance = float(account.get("balance", 0.0))
+    if balance <= 0:
+        return base_max
+    if balance < 80.0:
+        return min(base_max, 1)
+    if balance < 200.0:
+        return min(base_max, 2)
+    return base_max
+
+
 def floor_volume(volume, step):
     if step <= 0 or volume <= 0:
         return 0.0
@@ -2056,15 +2091,27 @@ def build_order(broker, candidate, account):
     if reference_loss <= 0:
         return reject("Broker profit calculation returned <= 0")
 
+    risk_budget = dynamic_risk_budget(account, score=float(candidate.get("score", 8.0)))
+    balance = float(account.get("balance", 0.0))
+    max_fallback_pct = float(getattr(CFG, "MIN_LOT_FALLBACK_MAX_RISK_PCT", 6.0))
+    max_fallback_budget = max(risk_budget, balance * (max_fallback_pct / 100.0)) if balance > 0 else risk_budget
+
     estimated_per_lot = reference_loss / minimum
-    volume = floor_volume(min(CFG.RISK_PER_TRADE / estimated_per_lot, maximum), step)
+    volume = floor_volume(min(risk_budget / estimated_per_lot, maximum), step)
 
     if volume + CFG.EPSILON < minimum:
-        return reject(f"Calculated volume ({volume:.4f}) < Min lot ({minimum}) (Risk budget too small for SL)")
+        if reference_loss <= max_fallback_budget + CFG.EPSILON:
+            volume = minimum
+            risk_budget = max(risk_budget, reference_loss)
+        else:
+            return reject(
+                f"Calculated volume ({volume:.4f}) < Min lot ({minimum}) "
+                f"(Min lot risk ${reference_loss:.2f} > Max safe budget ${max_fallback_budget:.2f})"
+            )
 
     estimated_loss = abs(broker.profit(order_type, symbol, volume, worse_entry, worse_stop)) + CFG.COMMISSION_PER_LOT * volume
-    if estimated_loss > CFG.RISK_PER_TRADE + CFG.EPSILON:
-        return reject(f"Estimated loss ({estimated_loss:.2f}) > Risk budget ({CFG.RISK_PER_TRADE})")
+    if estimated_loss > risk_budget + CFG.EPSILON:
+        return reject(f"Estimated loss ({estimated_loss:.2f}) > Risk budget ({risk_budget:.2f})")
 
     margin = broker.margin(order_type, symbol, volume, entry)
     if margin < 0 or margin > float(account["margin_free"]) * 0.90:
@@ -2389,7 +2436,11 @@ def resolve_pending(broker, state, path):
                     )
                 ) + CFG.COMMISSION_PER_LOT * volume
 
-                if actual_risk > CFG.RISK_PER_TRADE + CFG.EPSILON:
+                allowed_risk_ceiling = max(
+                    float(CFG.RISK_PER_TRADE),
+                    float(pending["metadata"].get("estimated_loss", CFG.RISK_PER_TRADE)) * 1.35,
+                )
+                if actual_risk > allowed_risk_ceiling + CFG.EPSILON:
                     mark_halt(
                         state, path,
                         "Confirmed entry risk exceeds the configured budget.",
@@ -2806,7 +2857,7 @@ def entry_permission(broker, state, snapshot, positions, orders):
         if int(position.get("magic", 0)) == CFG.MAGIC
     ]
 
-    if len(bot_positions) >= CFG.MAX_OPEN_POSITIONS:
+    if len(bot_positions) >= dynamic_max_open_positions(snapshot["account"]):
         return False, "The open-position limit has been reached."
 
     if any(int(order.get("magic", 0)) == CFG.MAGIC for order in orders):
@@ -3372,7 +3423,7 @@ def main():
                             p for p in fresh_positions 
                             if int(p.get("magic", 0)) == CFG.MAGIC
                         ]
-                        if len(bot_positions) >= CFG.MAX_OPEN_POSITIONS:
+                        if len(bot_positions) >= dynamic_max_open_positions(fresh_snapshot["account"]):
                             break
 
                         built = build_order(

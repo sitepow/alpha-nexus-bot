@@ -72,6 +72,9 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 # 4. RISK & ACCOUNT MANAGEMENT
 # ==========================================
 RISK_PER_TRADE = env_float("RISK_PER_TRADE", 15.0)
+USE_DYNAMIC_RISK = env_bool("USE_DYNAMIC_RISK", True)
+RISK_PCT = env_float("RISK_PCT", 3.0)
+MIN_LOT_FALLBACK_MAX_RISK_PCT = env_float("MIN_LOT_FALLBACK_MAX_RISK_PCT", 6.0)
 COMMISSION_PER_LOT = env_float("COMMISSION_PER_LOT", 0.0)
 MAX_LOT = env_float("MAX_LOT", 5.0)
 MAX_OPEN_POSITIONS = env_int("MAX_OPEN_POSITIONS", 3)
