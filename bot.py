@@ -896,12 +896,31 @@ class Broker:
 
     def select_symbols(self):
         valid_symbols = []
+        disabled_mode = self.constant("SYMBOL_TRADE_MODE_DISABLED")
+        closeonly_mode = self.constant("SYMBOL_TRADE_MODE_CLOSEONLY")
+
         for symbol in CFG.SYMBOLS:
-            success = self.read(f"mt5.symbol_select({symbol!r}, True)")
-            if success:
-                valid_symbols.append(symbol)
+            chosen = None
+            for candidate_sym in (symbol, f"{symbol}m", f"{symbol}.a", f"{symbol}.pro", f"{symbol}.raw"):
+                try:
+                    success = self.read(f"mt5.symbol_select({candidate_sym!r}, True)")
+                    if not success:
+                        continue
+                    info = self.info(candidate_sym)
+                    if int(info.get("trade_mode", disabled_mode)) not in {disabled_mode, closeonly_mode}:
+                        chosen = candidate_sym
+                        break
+                except Exception:
+                    continue
+
+            if chosen is not None:
+                if chosen != symbol:
+                    print(f"--- [INFO] Auto-mapped symbol {symbol} -> {chosen} (tradable). ---", flush=True)
+                if chosen not in valid_symbols:
+                    valid_symbols.append(chosen)
             else:
-                print(f"--- [WARNING] Symbol {symbol} cannot be selected and will be skipped. ---", flush=True)
+                print(f"--- [WARNING] Symbol {symbol} is unavailable or trade_mode=DISABLED and will be skipped. ---", flush=True)
+
         CFG.SYMBOLS = valid_symbols
         if not CFG.SYMBOLS:
             raise FatalError("No valid symbols could be selected.")
@@ -3158,10 +3177,17 @@ def main():
                 if all_candidates:
                     all_candidates.sort(key=lambda x: x["score"], reverse=True)
 
-                    top_signal_text = "Top Ranked Signals:\n"
-                    for c in all_candidates[:5]:
-                        top_signal_text += f"- {c['symbol']} ({c['side']}) [{c['zone']['kind']}] | Score: {c['score']:.2f}\n"
-                    notify(top_signal_text)
+                    notified_set = getattr(main, "_notified_zones", set())
+                    new_for_notify = [c for c in all_candidates[:5] if c["zone_id"] not in notified_set]
+                    if new_for_notify:
+                        top_signal_text = "Top Ranked Signals:\n"
+                        for c in new_for_notify:
+                            top_signal_text += f"- {c['symbol']} ({c['side']}) [{c['zone']['kind']}] | Score: {c['score']:.2f}\n"
+                            notified_set.add(c["zone_id"])
+                        if len(notified_set) > 500:
+                            notified_set.clear()
+                        main._notified_zones = notified_set
+                        notify(top_signal_text)
 
                     for candidate in all_candidates:
                         symbol = candidate["symbol"]
@@ -3205,6 +3231,8 @@ def main():
                         )
 
                         if built is None:
+                            state["seen_zones"][zone_id] = time.time()
+                            atomic_save(state_path, state)
                             continue
 
                         request, estimated_loss = built
