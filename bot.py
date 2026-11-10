@@ -601,7 +601,6 @@ def validate_config():
         CFG.TP2_RR,
         CFG.TRAIL_ATR,
         CFG.TIME_EXIT_MINUTES,
-        CFG.NEWS_FILE_MAX_AGE_HOURS,
         CFG.MAX_TICK_AGE_SECONDS,
         CFG.MAX_CLOSED_M5_AGE_SECONDS,
     ]
@@ -1701,18 +1700,6 @@ def m15_confirmation(candidate, bars):
         return getattr(CFG, "M15_SCORE_BOOST_VALUE", 1.5)
 
     return 0.0
-
-def parse_utc_timestamp(value):
-    if not isinstance(value, str):
-        raise ValueError("UTC timestamp must be a string.")
-
-    stamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
-
-    if stamp.tzinfo is None:
-        raise ValueError("Timezone-aware timestamp required.")
-
-    return stamp.astimezone(timezone.utc).timestamp()
-
 
 def get_news_sentiment_score(symbol, side, m5_bars=None):
     if not getattr(CFG, "ENABLE_NEWS_SCORING_PENALTY", True):
