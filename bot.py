@@ -1321,12 +1321,21 @@ def create_zones(symbol, bars, side):
         candle_range = impulse["high"] - impulse["low"]
         directional = impulse["close"] > impulse["open"] if buy else impulse["close"] < impulse["open"]
 
-        if (
-            not directional
-            or candle_range <= 0
-            or body < CFG.DISPLACEMENT_ATR * reference_atr
-            or (body / candle_range) < CFG.DISPLACEMENT_BODY_RATIO
-        ):
+        single_ok = (
+            directional
+            and candle_range > 0
+            and body >= (CFG.DISPLACEMENT_ATR * 0.85 * reference_atr)
+            and (body / candle_range) >= (CFG.DISPLACEMENT_BODY_RATIO * 0.90)
+        )
+        two_bar_ok = False
+        if not single_ok and directional and candle_range > 0:
+            prev_imp = bars[impulse_index - 1]
+            prev_dir = prev_imp["close"] > prev_imp["open"] if buy else prev_imp["close"] < prev_imp["open"]
+            combined_body = body + abs(prev_imp["close"] - prev_imp["open"])
+            if prev_dir and combined_body >= (CFG.DISPLACEMENT_ATR * 1.35 * reference_atr) and (body / candle_range) >= 0.45:
+                two_bar_ok = True
+
+        if not (single_ok or two_bar_ok):
             continue
 
         pivot = first_structure_break(bars, impulse_index, side, reference_atr)
@@ -1380,18 +1389,23 @@ def create_zones(symbol, bars, side):
             if not (pd_zone_bottom <= midpoint <= pd_zone_top):
                 return
 
-            subsequent_m15 = bars[final_index + 1 : -2] if final_index + 1 < len(bars) - 2 else []
+            subsequent_m15 = bars[final_index + 1 : -3] if final_index + 1 < len(bars) - 3 else []
+            inv_buf = reference_atr * 0.15
+            prior_deep_touches = 0
             for m_bar in subsequent_m15:
                 if buy:
-                    if m_bar["close"] < bottom:
+                    if m_bar["close"] < bottom - inv_buf:
                         return
                     if m_bar["low"] <= midpoint:
-                        return
+                        prior_deep_touches += 1
                 else:
-                    if m_bar["close"] > top:
+                    if m_bar["close"] > top + inv_buf:
                         return
                     if m_bar["high"] >= midpoint:
-                        return
+                        prior_deep_touches += 1
+
+            if prior_deep_touches >= 2:
+                return
 
             key = f"{side}:{kind}:{bars[source_index]['time']}:{created}"
             result.append({
@@ -1407,6 +1421,7 @@ def create_zones(symbol, bars, side):
                 "bos_level": bos_level_val,
                 "is_mitigation": bool(is_mitigation),
                 "confluence": bool(confluence),
+                "is_fresh": (prior_deep_touches == 0),
             })
 
         ob_candidates = []
@@ -1485,26 +1500,33 @@ def zone_signal(zone, bars, volatility, pdh=None, pdl=None, broker=None):
     if not eligible:
         return None
 
-    touch = None
+    first_touch = None
     for index in eligible:
         bar = bars[index]
         reached = bar["low"] <= zone["top"] if buy else bar["high"] >= zone["bottom"]
         if reached:
-            touch = index
+            first_touch = index
             break
 
-    if touch is None:
+    if first_touch is None:
         return None
+
+    invalidation_buffer = volatility[first_touch] * 0.15 if volatility[first_touch] > 0 else 0.0
+    if any(
+        (bar["close"] < zone["bottom"] - invalidation_buffer if buy else bar["close"] > zone["top"] + invalidation_buffer)
+        for bar in bars[first_touch:]
+    ):
+        return None
+
+    recent_window_start = max(first_touch, latest - (CFG.SWEEP_AFTER_TOUCH_BARS + CFG.CONFIRM_AFTER_SWEEP_BARS))
+    recent_touches = [
+        idx for idx in range(recent_window_start, latest + 1)
+        if (bars[idx]["low"] <= zone["top"] if buy else bars[idx]["high"] >= zone["bottom"])
+    ]
+    touch = recent_touches[0] if recent_touches else first_touch
 
     if latest - touch > CFG.MAX_TOUCH_WAIT_BARS:
         base_score_modifier -= 1.5
-
-    invalidation_buffer = volatility[touch] * 0.15 if volatility[touch] > 0 else 0.0
-    if any(
-        (bar["close"] < zone["bottom"] - invalidation_buffer if buy else bar["close"] > zone["top"] + invalidation_buffer)
-        for bar in bars[touch:]
-    ):
-        return None
 
     sweep_end = min(touch + CFG.SWEEP_AFTER_TOUCH_BARS, latest - 1)
 
@@ -1955,7 +1977,8 @@ def build_order(broker, candidate, account):
     if int(info["trade_mode"]) not in allowed_modes:
         return reject(f"Broker trade mode blocked (mode={info['trade_mode']})")
 
-    spread_limit = float(CFG.MAX_SPREAD_BY_SYMBOL.get(symbol, CFG.MAX_SPREAD_POINTS))
+    base_spread_limit = float(CFG.MAX_SPREAD_BY_SYMBOL.get(symbol, CFG.MAX_SPREAD_POINTS))
+    spread_limit = base_spread_limit * (1.20 if is_prime_killzone_utc() else 1.0)
     current_spread = spread_points(tick, info)
     if current_spread > spread_limit:
         return reject(f"Spread too high ({current_spread:.1f} pts > {spread_limit:.1f} pts)")
