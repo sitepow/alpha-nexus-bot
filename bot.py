@@ -96,7 +96,7 @@ def send_telegram_log_async(message):
 ROOT = Path(__file__).resolve().parent
 load_dotenv(ROOT / ".env")
 
-SHARED_NEWS_FETCHER = NewsFetcher(check_interval=1800)
+SHARED_NEWS_FETCHER = NewsFetcher(check_interval=300)
 SHARED_NEWS_FETCHER.start()
 
 LOCK_HANDLE = None
@@ -1481,23 +1481,18 @@ def parse_utc_timestamp(value):
     return stamp.astimezone(timezone.utc).timestamp()
 
 
-def get_news_sentiment_score(symbol, side):
-    if not getattr(CFG, "ENABLE_NEWS_SCORING_PENALTY", False):
+def get_news_sentiment_score(symbol, side, m5_bars=None):
+    if not getattr(CFG, "ENABLE_NEWS_SCORING_PENALTY", True):
         return 0.0
+
+    from bot_news import parse_economic_number, is_inverse_indicator
 
     now = datetime.now(timezone.utc).replace(tzinfo=None)
-    clean = re.sub(r"[^A-Z]", "", symbol.upper())
-    if len(clean) < 6:
+    base_currency, quote_currency, relevant_currencies = SHARED_NEWS_FETCHER.map_symbol_currencies(symbol)
+    if not relevant_currencies:
         return 0.0
-    clean = clean[:6]
 
-    base_currency = clean[:3]
-    quote_currency = clean[3:6]
-    
-    relevant_currencies = {base_currency, quote_currency}
-    if "USD" in relevant_currencies or "XAU" in clean or "XAG" in clean:
-        relevant_currencies.update(["USD", "EUR", "GBP", "JPY", "AUD", "CAD"])
-
+    post_window = float(getattr(CFG, "NEWS_POST_SENTIMENT_MINUTES", 90.0))
     sentiment_score = 0.0
 
     with SHARED_NEWS_FETCHER._lock:
@@ -1505,58 +1500,64 @@ def get_news_sentiment_score(symbol, side):
             cur = news.get("currency")
             if cur not in relevant_currencies:
                 continue
-            
+
             news_time = news.get("time")
             if not news_time:
                 continue
-                
-            diff_minutes = (news_time - now).total_seconds() / 60
-            if -30 <= diff_minutes <= 30:
-                impact = news.get("impact", "Medium")
-                actual = news.get("actual")
-                forecast = news.get("forecast")
-                
-                direction_bias = "NEUTRAL"
-                if actual is not None and actual != "" and forecast is not None and forecast != "":
-                    try:
-                        act_val = float(str(actual).replace('%', '').strip())
-                        fore_val = float(str(forecast).replace('%', '').strip())
-                        
-                        if act_val > fore_val:
-                            direction_bias = "BULLISH"
-                        elif act_val < fore_val:
-                            direction_bias = "BEARISH"
-                    except ValueError:
-                        pass
-                
-                is_base = (cur == base_currency or (cur == "USD" and base_currency in ["XAU", "XAG"]))
-                
-                if direction_bias == "BULLISH":
-                    favorable_side = "BUY" if is_base else "SELL"
-                elif direction_bias == "BEARISH":
-                    favorable_side = "SELL" if is_base else "BUY"
+
+            minutes_since_release = (now - news_time).total_seconds() / 60.0
+            if not (0.0 <= minutes_since_release <= post_window):
+                continue
+
+            impact = news.get("impact", "Medium")
+            title = news.get("title", "")
+            act_val = parse_economic_number(news.get("actual"))
+            ref_val = parse_economic_number(news.get("forecast"))
+            if ref_val is None:
+                ref_val = parse_economic_number(news.get("previous"))
+
+            favorable_side = "NEUTRAL"
+
+            if act_val is not None and ref_val is not None and abs(act_val - ref_val) > 1e-12:
+                inverse = is_inverse_indicator(title)
+                if act_val > ref_val:
+                    currency_bias = "BEARISH" if inverse else "BULLISH"
                 else:
-                    favorable_side = "NEUTRAL"
+                    currency_bias = "BULLISH" if inverse else "BEARISH"
 
-                boost_val = getattr(CFG, "NEWS_SCORE_BOOST_HIGH", 3.0) if impact == "High" else getattr(CFG, "NEWS_SCORE_BOOST_MED", 1.5)
-                penalty_val = CFG.NEWS_HIGH_IMPACT_PENALTY if impact == "High" else CFG.NEWS_MEDIUM_IMPACT_PENALTY
+                is_base = (cur == base_currency)
+                if currency_bias == "BULLISH":
+                    favorable_side = "BUY" if is_base else "SELL"
+                else:
+                    favorable_side = "SELL" if is_base else "BUY"
 
-                if favorable_side == side:
-                    sentiment_score += boost_val
-                elif favorable_side != "NEUTRAL" and favorable_side != side:
-                    sentiment_score -= penalty_val
+            elif m5_bars and len(m5_bars) >= 3:
+                release_ts = int(news_time.replace(tzinfo=timezone.utc).timestamp())
+                reaction_bars = [b for b in m5_bars if release_ts <= b["time"] <= release_ts + 900]
+                if reaction_bars:
+                    open_p = reaction_bars[0]["open"]
+                    close_p = reaction_bars[-1]["close"]
+                    net_move = close_p - open_p
+                    ref_range = sum(b["high"] - b["low"] for b in m5_bars[-20:]) / 20.0
+                    if ref_range > 0 and abs(net_move) >= ref_range * 1.2:
+                        favorable_side = "BUY" if net_move > 0 else "SELL"
 
-    return sentiment_score
+            boost_val = getattr(CFG, "NEWS_SCORE_BOOST_HIGH", 3.0) if impact == "High" else getattr(CFG, "NEWS_SCORE_BOOST_MED", 1.5)
+            penalty_val = CFG.NEWS_HIGH_IMPACT_PENALTY if impact == "High" else CFG.NEWS_MEDIUM_IMPACT_PENALTY
+
+            if favorable_side == side:
+                sentiment_score += boost_val
+            elif favorable_side != "NEUTRAL" and favorable_side != side:
+                sentiment_score -= penalty_val
+
+    return max(-penalty_val, min(sentiment_score, boost_val))
 
 def news_permission(broker, symbol):
-    if getattr(CFG, "ENABLE_NEWS_SCORING_PENALTY", False):
-        return True, "News sentiment scoring mode active."
-
     if not CFG.ENABLE_NEWS_FILTER:
         return True, "News filter disabled."
 
     if SHARED_NEWS_FETCHER.is_restricted_time(symbol, buffer_minutes=CFG.NEWS_BEFORE_MINUTES):
-        return False, "A high-impact news blackout is active (Dynamic API)."
+        return False, "A high/medium-impact news blackout window is active."
 
     return True, "News checks passed."
 
@@ -1637,7 +1638,7 @@ def scan_symbol(broker, symbol, state):
 
         candidate["score"] = candidate.get("score", 6.0) + score_boost
 
-        news_sentiment = get_news_sentiment_score(symbol, candidate["side"])
+        news_sentiment = get_news_sentiment_score(symbol, candidate["side"], m5_bars=m5)
         candidate["score"] += news_sentiment
 
     eligible = [(k, c) for (k, c) in candidates if c["score"] >= CFG.MIN_SCORING_THRESHOLD]

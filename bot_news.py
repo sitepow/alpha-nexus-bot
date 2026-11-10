@@ -2,6 +2,7 @@ from datetime import datetime, timedelta, timezone
 import json
 import logging
 from pathlib import Path
+import re
 import threading
 import time
 import requests
@@ -14,8 +15,54 @@ logging.basicConfig(
 )
 log = logging.getLogger("NewsFetcher")
 
+INVERSE_ECONOMIC_KEYWORDS = (
+    "unemployment",
+    "jobless",
+    "claims",
+    "claimant",
+    "layoffs",
+)
+
+def parse_economic_number(raw_value):
+    if raw_value is None:
+        return None
+    text = str(raw_value).strip().upper().replace(",", "")
+    if not text:
+        return None
+
+    multiplier = 1.0
+    if text.endswith("K"):
+        multiplier = 1e3
+        text = text[:-1]
+    elif text.endswith("M"):
+        multiplier = 1e6
+        text = text[:-1]
+    elif text.endswith("B"):
+        multiplier = 1e9
+        text = text[:-1]
+    elif text.endswith("T"):
+        multiplier = 1e12
+        text = text[:-1]
+
+    text = text.replace("%", "").replace("$", "").replace("€", "").replace("£", "").strip()
+    match = re.search(r"[-+]?\d*\.?\d+", text)
+    if not match or match.group(0) in {"", "-", "+", "."}:
+        return None
+    try:
+        return float(match.group(0)) * multiplier
+    except ValueError:
+        return None
+
+
+def is_inverse_indicator(title: str) -> bool:
+    if not title:
+        return False
+    lower_title = str(title).lower()
+    return any(keyword in lower_title for keyword in INVERSE_ECONOMIC_KEYWORDS)
+
+
 class NewsFetcher:
-    def __init__(self, check_interval=1800, cache_dir=None):
+    def __init__(self, check_interval=300, cache_dir=None):
         self.check_interval = max(check_interval, CFG.NEWS_MIN_FETCH_INTERVAL_SEC)
         self.high_impact_news = []
         self._lock = threading.Lock()
@@ -105,7 +152,6 @@ class NewsFetcher:
 
         last_error = "all sources failed"
         for src in CFG.NEWS_SOURCES:
-            # log.info("Fetching calendar: %s", src)
             try:
                 resp = requests.get(src, headers=headers, timeout=CFG.NEWS_REQUEST_TIMEOUT_SEC)
             except requests.RequestException as e:
@@ -128,7 +174,7 @@ class NewsFetcher:
                 self._next_allowed_ts = 0.0
                 self._save_cache_to_disk(data)
 
-                log.info("✓ Fetched %d High/Medium news from %s", len(parsed), src)
+                log.info("Fetched %d High/Medium news from %s", len(parsed), src)
                 return
 
             if resp.status_code == 429:
@@ -157,7 +203,7 @@ class NewsFetcher:
             impact = item.get("impact")
             if impact not in CFG.NEWS_IMPACTS_TRACKED and impact != "Medium":
                 continue
-                
+
             time_str = item.get("date")
             try:
                 news_time = datetime.strptime(time_str[:19], "%Y-%m-%dT%H:%M:%S")
@@ -166,12 +212,13 @@ class NewsFetcher:
 
             if news_time >= now - timedelta(hours=CFG.NEWS_LOOKBACK_HOURS):
                 out.append({
-                    "title": item.get("title"),
-                    "currency": item.get("country"),
+                    "title": item.get("title") or "",
+                    "currency": (item.get("country") or "").upper(),
                     "time": news_time,
                     "impact": impact,
                     "actual": item.get("actual"),
                     "forecast": item.get("forecast"),
+                    "previous": item.get("previous"),
                 })
         return out
 
@@ -181,40 +228,55 @@ class NewsFetcher:
             backoff_time = CFG.NEWS_DEFAULT_BACKOFF_SEC * (2 ** (self._consecutive_failures - 1))
             self._next_allowed_ts = time.time() + min(CFG.NEWS_MAX_BACKOFF_SEC, backoff_time)
 
-    def is_restricted_time(self, symbol: str, buffer_minutes: int = 30) -> bool:
-        now = datetime.now(timezone.utc).replace(tzinfo=None)
-        import re as _re
-        clean = _re.sub(r"[^A-Z]", "", symbol.upper())
-        if len(clean) < 6:
-            return False
-        clean = clean[:6]
+    @staticmethod
+    def map_symbol_currencies(symbol: str):
+        clean = re.sub(r"[^A-Z0-9]", "", symbol.upper())
+        base_cur = clean[:3] if len(clean) >= 3 else ""
+        quote_cur = clean[3:6] if len(clean) >= 6 else "USD"
 
-        currencies = {clean[:3], clean[3:6]}
-        related = set()
-        if "USD" in currencies:
-            related.update(["EUR", "GBP", "JPY", "AUD", "NZD", "CAD", "CHF", "XAU", "XAG"])
-        if "EUR" in currencies:
-            related.update(["USD", "GBP", "CHF"])
-        if "GBP" in currencies:
-            related.update(["USD", "EUR"])
-        if "JPY" in currencies:
-            related.update(["USD"])
-        currencies.update(related)
+        if any(idx in clean for idx in ("US30", "USTEC", "US500", "USOIL", "XNG")):
+            base_cur, quote_cur = "IDX", "USD"
+        elif "UK100" in clean or "UKOIL" in clean:
+            base_cur, quote_cur = "IDX", "GBP"
+        elif "DE30" in clean or "FR40" in clean:
+            base_cur, quote_cur = "IDX", "EUR"
+        elif "JP225" in clean:
+            base_cur, quote_cur = "IDX", "JPY"
+        elif "AUS200" in clean:
+            base_cur, quote_cur = "IDX", "AUD"
+
+        direct = {c for c in (base_cur, quote_cur) if c}
+        if base_cur in {"XAU", "XAG", "XPT", "XPD", "BTC", "ETH", "SOL", "XRP", "BNB", "ADA", "DOGE", "LINK", "DOT"}:
+            direct.add("USD")
+
+        return base_cur, quote_cur, direct
+
+    def is_restricted_time(self, symbol: str, buffer_minutes: int = 15) -> bool:
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        _, _, currencies = self.map_symbol_currencies(symbol)
+        if not currencies:
+            return False
+
+        high_before = float(getattr(CFG, "NEWS_BEFORE_MINUTES", buffer_minutes))
+        high_after = float(getattr(CFG, "NEWS_AFTER_MINUTES", 10.0))
+        med_before = float(getattr(CFG, "NEWS_MEDIUM_BEFORE_MINUTES", 10.0))
+        med_after = float(getattr(CFG, "NEWS_MEDIUM_AFTER_MINUTES", 5.0))
 
         with self._lock:
             for news in self.high_impact_news:
                 if news["currency"] not in currencies:
                     continue
-                    
-                impact_buffer = CFG.NEWS_HIGH_IMPACT_BUFFER_MIN if news["impact"] == "High" else CFG.NEWS_MEDIUM_IMPACT_BUFFER_MIN
-                effective_buffer = max(buffer_minutes, impact_buffer)
-                
-                diff = (news["time"] - now).total_seconds() / 60
-                if -effective_buffer <= diff <= effective_buffer:
+
+                is_high = (news["impact"] == "High")
+                before_window = max(float(buffer_minutes), high_before) if is_high else med_before
+                after_window = high_after if is_high else med_after
+
+                minutes_until = (news["time"] - now).total_seconds() / 60.0
+                if -after_window <= minutes_until <= before_window:
                     log.info(
                         "RESTRICTED | %s | [%s] %s (%s) @ %s UTC (Δ%.1fmin)",
                         symbol, news["impact"], news["title"], news["currency"],
-                        news["time"].strftime("%H:%M"), diff,
+                        news["time"].strftime("%H:%M"), minutes_until,
                     )
                     return True
         return False
