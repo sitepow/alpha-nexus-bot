@@ -586,11 +586,17 @@ def calculate_bigbeluga_momentum(m5_bars, length=50, smooth=50, mult_dist=1.0):
     rising = cur > prev
     falling = cur < prev
 
-    direction = 1 if rising else (-1 if falling else 0)
+    raw_cur = raw_mom[-1]
+    if cur > 0 and (rising or raw_cur >= cur * 0.90):
+        direction = 1
+    elif cur < 0 and (falling or raw_cur <= cur * 0.90):
+        direction = -1
+    else:
+        direction = 1 if (rising and raw_cur > 0) else (-1 if (falling and raw_cur < 0) else 0)
 
-    bull_accel = rising and (cur > 0 or prev <= prev2) and (cur - prev) >= (prev - prev2)
-    bear_accel = falling and (cur < 0 or prev >= prev2) and (prev - cur) >= (prev2 - prev)
-    is_strong = bull_accel if rising else (bear_accel if falling else False)
+    bull_accel = (direction == 1) and ((cur > 0 and raw_cur > cur) or ((cur - prev) >= (prev - prev2) and rising))
+    bear_accel = (direction == -1) and ((cur < 0 and raw_cur < cur) or ((prev - cur) >= (prev2 - prev) and falling))
+    is_strong = bull_accel if direction == 1 else (bear_accel if direction == -1 else False)
 
     recent_ranges = [(highs[i] - lows[i]) for i in range(max(0, len(highs) - 100), len(highs))]
     dist = (sum(recent_ranges) / len(recent_ranges)) * mult_dist if recent_ranges else 0.0
