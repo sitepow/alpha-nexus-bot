@@ -2820,6 +2820,70 @@ def reconcile_positions(broker, state, path):
 
     return positions
 
+def is_friday_weekend_close_window():
+    if not getattr(CFG, "ENABLE_FRIDAY_WEEKEND_EXIT", True):
+        return False
+    now = utc_now()
+    if now.weekday() != 4:
+        return False
+    exit_h = int(getattr(CFG, "FRIDAY_EXIT_HOUR_UTC", 20))
+    exit_m = int(getattr(CFG, "FRIDAY_EXIT_MINUTE_UTC", 30))
+    return (now.hour > exit_h) or (now.hour == exit_h and now.minute >= exit_m)
+
+
+def send_daily_summary_report(broker, report_day, prev_start_balance, current_balance):
+    if not getattr(CFG, "ENABLE_DAILY_TELEGRAM_SUMMARY", True) or not report_day:
+        return
+    try:
+        day_start_dt = datetime.strptime(report_day, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        start_ts = day_start_dt.timestamp()
+        end_ts = start_ts + 86400.0
+        deals = broker.history(start_ts, end_ts)
+
+        exit_types = {
+            broker.constant("DEAL_ENTRY_OUT"),
+            broker.constant("DEAL_ENTRY_OUT_BY"),
+        }
+        pnl_by_pos = {}
+        sym_by_pos = {}
+        for deal in deals:
+            if not trade_deal(broker, deal):
+                continue
+            if int(deal.get("magic", 0)) != CFG.MAGIC and int(deal.get("entry", -1)) not in exit_types:
+                continue
+            pid = str(int(deal.get("position_id", 0)))
+            if pid == "0":
+                continue
+            pnl_by_pos[pid] = pnl_by_pos.get(pid, 0.0) + deal_cash(deal)
+            if deal.get("symbol"):
+                sym_by_pos[pid] = str(deal["symbol"])
+
+        closed_positions = [
+            (pid, pnl) for pid, pnl in pnl_by_pos.items()
+            if any(
+                str(int(d.get("position_id", 0))) == pid and int(d.get("entry", -1)) in exit_types
+                for d in deals
+            )
+        ]
+
+        total_trades = len(closed_positions)
+        wins = sum(1 for _, pnl in closed_positions if pnl > CFG.EPSILON)
+        losses = sum(1 for _, pnl in closed_positions if pnl < -CFG.EPSILON)
+        win_rate = (wins / total_trades * 100.0) if total_trades > 0 else 0.0
+        net_pnl = sum(pnl for _, pnl in closed_positions)
+        start_bal = float(prev_start_balance) if prev_start_balance and float(prev_start_balance) > 0 else (current_balance - net_pnl)
+        pnl_pct = (net_pnl / start_bal * 100.0) if start_bal > 0 else 0.0
+
+        notify(
+            f"=== DAILY PNL SUMMARY ({report_day}) ===\n"
+            f"Start Balance: {start_bal:.2f} USD\n"
+            f"End Balance: {current_balance:.2f} USD\n"
+            f"Net PnL: {net_pnl:+.2f} USD ({pnl_pct:+.2f}%)\n"
+            f"Closed Trades: {total_trades} (Wins: {wins} | Losses: {losses} | Win Rate: {win_rate:.1f}%)"
+        )
+    except Exception:
+        pass
+
 
 def daily_snapshot(broker, state, path):
     start = utc_midnight_timestamp()
@@ -2843,10 +2907,12 @@ def daily_snapshot(broker, state, path):
     total_cash = sum(deal_cash(deal) for deal in deals)
 
     if state["day"] != today:
+        prev_day = state.get("day", "")
+        prev_start_balance = state.get("day_start_balance")
+        new_start_balance = float(account["balance"]) - total_cash
+
         state["day"] = today
-        state["day_start_balance"] = (
-            float(account["balance"]) - total_cash
-        )
+        state["day_start_balance"] = new_start_balance
         state["daily_loss_latched"] = False
         state["dry_run_entries"] = 0
 
@@ -2858,6 +2924,8 @@ def daily_snapshot(broker, state, path):
         }
 
         atomic_save(path, state)
+        if prev_day:
+            send_daily_summary_report(broker, prev_day, prev_start_balance, new_start_balance)
 
     realized = sum(
         deal_cash(deal)
@@ -2913,6 +2981,9 @@ def daily_snapshot(broker, state, path):
 
 
 def in_session():
+    if is_friday_weekend_close_window():
+        return False
+
     hour = utc_now().hour
 
     if CFG.USE_KILLZONES_ONLY:
@@ -3130,6 +3201,22 @@ def manage_positions(broker, state, path):
                 effective_exit_min = base_exit_min
         else:
             effective_exit_min = base_exit_min
+
+        if is_friday_weekend_close_window():
+            request = partial_request(broker, position, volume)
+            execute_request(
+                broker,
+                state,
+                path,
+                "FULL_CLOSE",
+                request,
+                {
+                    "position_id": pid,
+                    "reason": "FRIDAY_WEEKEND_EXIT",
+                    "current_r": current_r,
+                },
+            )
+            return
 
         if (
             CFG.ENABLE_TIME_EXIT
