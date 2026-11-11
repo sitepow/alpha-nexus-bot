@@ -216,6 +216,14 @@ def scan_momentum_breakout_candidate(broker, symbol, m5_bars, side, volatility):
     box_low = min(b["low"] for b in prior_box)
     close_buffer = CFG.BOS_BUFFER_ATR * ref_atr
 
+    macro_window = m5_bars[-49:-1]
+    macro_high = max(b["high"] for b in macro_window)
+    macro_low = min(b["low"] for b in macro_window)
+    if buy and latest["close"] < macro_high and (macro_high - latest["close"]) < ref_atr * 2.5:
+        return None
+    if not buy and latest["close"] > macro_low and (latest["close"] - macro_low) < ref_atr * 2.5:
+        return None
+
     prev_three = m5_bars[-4:-1]
     if buy and all(b["close"] > b["open"] for b in prev_three):
         prior_run = latest["open"] - prev_three[0]["open"]
@@ -336,28 +344,50 @@ def detect_market_regime(h4_bars, m15_bars=None):
     ema_gap_now = abs(ema_fast[-1] - ema_slow[-1])
     ema_gap_prev = abs(ema_fast[-4] - ema_slow[-4])
     ema_expanding = ema_gap_now >= ema_gap_prev * 0.98
+    h4_bullish = ema_fast[-1] > ema_slow[-1]
 
     h4_er = calculate_efficiency_ratio(closes, period=10)
-    m15_er = 0.35
-    m15_vol_expanding = True
+    m15_er = 0.0
+    m15_vol_expanding = False
+    m15_aligned_with_h4 = False
+
     if m15_bars and len(m15_bars) >= 35:
         m15_closes = [b["close"] for b in m15_bars]
         m15_er = calculate_efficiency_ratio(m15_closes, period=16)
+        m15_ema50 = ema(m15_closes, 50)
+        m15_ema200 = ema(m15_closes, 200)
+        m15_net_move = m15_closes[-1] - m15_closes[-17]
+
+        if h4_bullish:
+            m15_aligned_with_h4 = (
+                m15_net_move > 0
+                and m15_closes[-1] > m15_ema50[-1]
+                and m15_ema50[-1] >= m15_ema200[-1]
+            )
+        else:
+            m15_aligned_with_h4 = (
+                m15_net_move < 0
+                and m15_closes[-1] < m15_ema50[-1]
+                and m15_ema50[-1] <= m15_ema200[-1]
+            )
+
         m15_atr_series = atr(m15_bars)
         if len(m15_atr_series) >= 25:
             recent_m15_atr = sum(m15_atr_series[-5:]) / 5.0
             base_m15_atr = sum(m15_atr_series[-25:-5]) / 20.0
-            m15_vol_expanding = recent_m15_atr >= base_m15_atr * 0.90
+            m15_vol_expanding = recent_m15_atr >= base_m15_atr * 0.95
 
     if ema_gap_now < (ref_h4_atr * 0.30):
         return "RANGING_SIDEWAY"
-    if h4_er < 0.15 and m15_er < 0.15 and not m15_vol_expanding:
+    if h4_er < 0.18 and m15_er < 0.20 and not m15_vol_expanding:
         return "RANGING_SIDEWAY"
 
     if (
         ema_gap_now >= (ref_h4_atr * 0.75)
         and ema_expanding
-        and (h4_er >= 0.42 or m15_er >= 0.45)
+        and h4_er >= 0.38
+        and m15_er >= 0.38
+        and m15_aligned_with_h4
         and m15_vol_expanding
     ):
         return "STRONG_TREND"
