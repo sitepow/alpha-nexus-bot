@@ -1863,6 +1863,14 @@ def scan_symbol(broker, symbol, state):
     volatility = atr(m5)
     current_price = m5[-1]["close"]
 
+    m15_closes = [bar["close"] for bar in m15]
+    if len(m15_closes) >= 200:
+        m15_ema200_now = ema(m15_closes, 200)[-1]
+        if side == "BUY" and (m15[-1]["close"] < m15_ema200_now or current_price < m15_ema200_now):
+            return None
+        if side == "SELL" and (m15[-1]["close"] > m15_ema200_now or current_price > m15_ema200_now):
+            return None
+
     candidates = []
 
     news_catalyst = get_news_sentiment_score(symbol, side, m5_bars=m5)
