@@ -129,19 +129,43 @@ class NewsFetcher:
             log.info("Skipping initial fetch — cache age=%.0fmin", cache_age / 60)
 
         while not self._stop_event.is_set():
-            if self._stop_event.wait(self.check_interval):
+            if self._stop_event.wait(30):
                 break
-            self._safe_fetch()
+            now_ts = time.time()
+            if self._needs_post_release_refresh():
+                post_refresh_sec = float(getattr(CFG, "NEWS_POST_RELEASE_REFRESH_SEC", 90.0))
+                if now_ts - self._last_fetch_ts >= post_refresh_sec:
+                    self._safe_fetch(force=True)
+            elif now_ts - self._last_fetch_ts >= self.check_interval:
+                self._safe_fetch(force=False)
 
-    def _safe_fetch(self) -> None:
+    def _needs_post_release_refresh(self) -> bool:
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        with self._lock:
+            for item in self.high_impact_news:
+                nt = item.get("time")
+                if not nt:
+                    continue
+                mins_since = (now - nt).total_seconds() / 60.0
+                if 1.0 <= mins_since <= 20.0:
+                    if parse_economic_number(item.get("actual")) is None:
+                        return True
+        return False
+
+    def _safe_fetch(self, force: bool = False) -> None:
         try:
-            self.fetch_calendar()
+            self.fetch_calendar(force=force)
         except Exception as e:
             log.error("Unexpected fetch error: %s", e)
 
-    def fetch_calendar(self) -> None:
+    def fetch_calendar(self, force: bool = False) -> None:
         now = time.time()
-        if now < self._next_allowed_ts or (now - self._last_fetch_ts < CFG.NEWS_MIN_FETCH_INTERVAL_SEC):
+        min_interval = (
+            float(getattr(CFG, "NEWS_POST_RELEASE_REFRESH_SEC", 90.0))
+            if force
+            else float(CFG.NEWS_MIN_FETCH_INTERVAL_SEC)
+        )
+        if now < self._next_allowed_ts or (now - self._last_fetch_ts < min_interval):
             return
 
         self._last_fetch_ts = now

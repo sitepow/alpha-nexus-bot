@@ -1761,8 +1761,9 @@ def get_news_sentiment_score(symbol, side, m5_bars=None):
         return 0.0
 
     post_window = float(getattr(CFG, "NEWS_POST_SENTIMENT_MINUTES", 90.0))
+    full_boost_mins = float(getattr(CFG, "NEWS_FULL_BOOST_MINUTES", 40.0))
     sentiment_score = 0.0
-    max_boost = float(getattr(CFG, "NEWS_SCORE_BOOST_HIGH", 3.0))
+    max_boost = float(getattr(CFG, "NEWS_SCORE_BOOST_HIGH", 3.0)) * 1.15
     max_penalty = float(getattr(CFG, "NEWS_HIGH_IMPACT_PENALTY", 4.0))
 
     with SHARED_NEWS_FETCHER._lock:
@@ -1787,6 +1788,7 @@ def get_news_sentiment_score(symbol, side, m5_bars=None):
                 ref_val = parse_economic_number(news.get("previous"))
 
             favorable_side = "NEUTRAL"
+            surprise_mult = 1.0
 
             if act_val is not None and ref_val is not None and abs(act_val - ref_val) > 1e-12:
                 inverse = is_inverse_indicator(title)
@@ -1801,6 +1803,15 @@ def get_news_sentiment_score(symbol, side, m5_bars=None):
                 else:
                     favorable_side = "SELL" if is_base else "BUY"
 
+                denom = max(abs(ref_val), 0.20)
+                rel_surprise = abs(act_val - ref_val) / denom
+                if rel_surprise >= 0.40:
+                    surprise_mult = 1.15
+                elif rel_surprise >= 0.15:
+                    surprise_mult = 1.0
+                else:
+                    surprise_mult = 0.70
+
             elif m5_bars and len(m5_bars) >= 3:
                 release_ts = int(news_time.replace(tzinfo=timezone.utc).timestamp())
                 reaction_bars = [b for b in m5_bars if release_ts <= b["time"] <= release_ts + 900]
@@ -1811,9 +1822,18 @@ def get_news_sentiment_score(symbol, side, m5_bars=None):
                     ref_range = sum(b["high"] - b["low"] for b in m5_bars[-20:]) / 20.0
                     if ref_range > 0 and abs(net_move) >= ref_range * 1.2:
                         favorable_side = "BUY" if net_move > 0 else "SELL"
+                        if abs(net_move) >= ref_range * 2.0:
+                            surprise_mult = 1.15
 
-            boost_val = getattr(CFG, "NEWS_SCORE_BOOST_HIGH", 3.0) if impact == "High" else getattr(CFG, "NEWS_SCORE_BOOST_MED", 1.5)
-            penalty_val = CFG.NEWS_HIGH_IMPACT_PENALTY if impact == "High" else CFG.NEWS_MEDIUM_IMPACT_PENALTY
+            if minutes_since_release <= full_boost_mins or post_window <= full_boost_mins:
+                time_decay = 1.0
+            else:
+                remaining_ratio = (post_window - minutes_since_release) / (post_window - full_boost_mins)
+                time_decay = max(0.25, min(1.0, remaining_ratio))
+
+            base_boost = getattr(CFG, "NEWS_SCORE_BOOST_HIGH", 3.0) if impact == "High" else getattr(CFG, "NEWS_SCORE_BOOST_MED", 1.5)
+            boost_val = base_boost * surprise_mult * time_decay
+            penalty_val = (CFG.NEWS_HIGH_IMPACT_PENALTY if impact == "High" else CFG.NEWS_MEDIUM_IMPACT_PENALTY) * max(0.5, time_decay)
 
             if favorable_side == side:
                 sentiment_score += boost_val
