@@ -14,7 +14,7 @@ Signal rules:
 - Zone age and touch timeout limits.
 
 Execution rules:
-- Live execution enabled by default for dedicated Demo/VPS deployment (set DRY_RUN=true in .env to disable).
+- Safe defaults: DRY_RUN=true and ALLOW_LIVE_TRADING=false unless explicitly enabled in .env.
 - Live mode requires ALLOW_LIVE_TRADING=true.
 - Hedging accounts only.
 - One position or active order per symbol, regardless of magic.
@@ -65,18 +65,24 @@ try:
 except ImportError:
     fcntl = None
 
+CRYPTO_BASE_CURRENCIES = {
+    "BTC", "XBT", "ETH", "SOL", "XRP", "BNB", "ADA", "DOGE", "LINK", "DOT", "AVAX", "LTC", "BCH"
+}
+
+
 def is_crypto_symbol(symbol):
-    clean = re.sub(r"[^A-Z0-9]", "", str(symbol).upper())
-    return clean.startswith(("BTC", "ETH", "SOL", "XRP", "BNB", "ADA", "DOGE", "LINK", "DOT", "AVAX"))
+    base_c, _, _ = NewsFetcher.map_symbol_currencies(str(symbol))
+    return base_c in CRYPTO_BASE_CURRENCIES
 
 
-def is_weekend():
+def is_weekend(symbols=None):
+    active_list = symbols if symbols is not None else CFG.SYMBOLS
     current_utc_time = datetime.now(timezone.utc)
     if current_utc_time.weekday() < 5:
         return False
     if current_utc_time.weekday() == 6 and current_utc_time.hour >= 22:
         return False
-    return not any(is_crypto_symbol(sym) for sym in CFG.SYMBOLS)
+    return not any(is_crypto_symbol(sym) for sym in active_list)
 
 
 def is_monday_opening_gap_window(symbol):
@@ -86,35 +92,85 @@ def is_monday_opening_gap_window(symbol):
     if cooldown_mins <= 0:
         return False
     now = utc_now()
-    if now.weekday() == 6 and now.hour >= 21:
+    if now.weekday() == 6:
+        if now.hour < 22:
+            return True
         minutes_since_reopen = (now.hour - 22) * 60 + now.minute
         return minutes_since_reopen < cooldown_mins
-    if now.weekday() == 0 and now.hour == 0 and now.minute < cooldown_mins:
-        return True
+    if now.weekday() == 0:
+        minutes_since_sunday_reopen = 120 + now.hour * 60 + now.minute
+        if minutes_since_sunday_reopen < cooldown_mins:
+            return True
+        if now.hour == 0 and now.minute < min(cooldown_mins, 15):
+            return True
     return False
 
-_TELEGRAM_QUEUE = queue.Queue(maxsize=500)
+
+_TELEGRAM_CRITICAL_QUEUE = queue.Queue(maxsize=200)
+_TELEGRAM_INFO_QUEUE = queue.Queue(maxsize=1000)
+
+
+def _configure_logging():
+    logging.Formatter.converter = time.gmtime
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+    formatter = logging.Formatter(
+        "%(asctime)s UTC | %(levelname)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    if not any(
+        isinstance(h, logging.StreamHandler) and not isinstance(h, TelegramLogHandler)
+        for h in root_logger.handlers
+    ):
+        console_handler = logging.StreamHandler(sys.stdout)
+        console_handler.setLevel(logging.INFO)
+        console_handler.setFormatter(formatter)
+        root_logger.addHandler(console_handler)
+    return root_logger, formatter
 
 
 def _telegram_worker():
     while True:
-        message = _TELEGRAM_QUEUE.get()
-        if message is None:
-            break
+        is_critical = False
+        message = None
         try:
-            requests.post(
-                f"https://api.telegram.org/bot{CFG.TELEGRAM_TOKEN}/sendMessage",
-                json={
-                    "chat_id": CFG.TELEGRAM_CHAT_ID,
-                    "text": message,
-                    "disable_web_page_preview": True,
-                },
-                timeout=5,
-            )
-        except Exception:
-            pass
+            message = _TELEGRAM_CRITICAL_QUEUE.get_nowait()
+            is_critical = True
+        except queue.Empty:
+            try:
+                message = _TELEGRAM_INFO_QUEUE.get(timeout=1.0)
+            except queue.Empty:
+                continue
+
+        if message is None:
+            if is_critical:
+                _TELEGRAM_CRITICAL_QUEUE.task_done()
+            break
+
+        try:
+            attempts = 3 if is_critical else 1
+            for attempt in range(attempts):
+                try:
+                    resp = requests.post(
+                        f"https://api.telegram.org/bot{CFG.TELEGRAM_TOKEN}/sendMessage",
+                        json={
+                            "chat_id": CFG.TELEGRAM_CHAT_ID,
+                            "text": message,
+                            "disable_web_page_preview": True,
+                        },
+                        timeout=5,
+                    )
+                    if resp.status_code == 200:
+                        break
+                except Exception:
+                    pass
+                if attempt + 1 < attempts:
+                    time.sleep(1.5)
         finally:
-            _TELEGRAM_QUEUE.task_done()
+            if is_critical:
+                _TELEGRAM_CRITICAL_QUEUE.task_done()
+            else:
+                _TELEGRAM_INFO_QUEUE.task_done()
 
 
 if CFG.TELEGRAM_TOKEN and CFG.TELEGRAM_CHAT_ID:
@@ -125,22 +181,36 @@ class TelegramLogHandler(logging.Handler):
     def emit(self, record):
         try:
             log_entry = self.format(record)
-            if record.levelno >= logging.INFO:
-                send_telegram_log_async(log_entry)
+            if record.levelno >= logging.WARNING:
+                send_telegram_log_async(log_entry, critical=True)
+            elif record.levelno >= logging.INFO:
+                send_telegram_log_async(log_entry, critical=False)
         except Exception:
             self.handleError(record)
 
 
-def send_telegram_log_async(message):
+def send_telegram_log_async(message, critical=False):
     if not CFG.TELEGRAM_TOKEN or not CFG.TELEGRAM_CHAT_ID:
         return
+    clean_msg = safe_text(message)
+    target_q = _TELEGRAM_CRITICAL_QUEUE if critical else _TELEGRAM_INFO_QUEUE
     try:
-        _TELEGRAM_QUEUE.put_nowait(safe_text(message))
+        target_q.put_nowait(clean_msg)
     except queue.Full:
-        pass
+        if critical:
+            try:
+                target_q.get_nowait()
+                target_q.task_done()
+            except queue.Empty:
+                pass
+            try:
+                target_q.put_nowait(clean_msg)
+            except queue.Full:
+                pass
 
 ROOT = Path(__file__).resolve().parent
 load_dotenv(ROOT / ".env")
+_configure_logging()
 
 SHARED_NEWS_FETCHER = NewsFetcher(check_interval=300)
 SHARED_NEWS_FETCHER.start()
@@ -175,7 +245,7 @@ def analyze_order_flow(broker, symbol, side, reference_bar, bars=None):
     buy = (side == "BUY")
 
     try:
-        book = broker.read(f"mt5.market_book_get({symbol!r})")
+        book = broker.market_book(symbol) if hasattr(broker, "market_book") else broker.read(f"mt5.market_book_get({symbol!r})")
         if book and isinstance(book, list) and len(book) > 0:
             ask_volume_total = sum(float(item.get("volume", 0)) for item in book if item.get("type") == 1)
             bid_volume_total = sum(float(item.get("volume", 0)) for item in book if item.get("type") == 2)
@@ -438,12 +508,12 @@ def safe_text(text):
     )
 
 
-def log(message):
-    logging.info(safe_text(message))
+def log(message, level=logging.INFO):
+    logging.log(level, safe_text(message))
 
-def notify(message):
-    message = safe_text(message)
-    log(message)
+
+def notify(message, critical=False):
+    log(message, level=logging.WARNING if critical else logging.INFO)
 
 def get_dynamic_sweep_atr(symbol, base_atr):
     if base_atr <= 0:
@@ -451,13 +521,14 @@ def get_dynamic_sweep_atr(symbol, base_atr):
     if not symbol:
         return base_atr * getattr(CFG, "SWEEP_MIN_ATR", 0.10)
 
-    symbol_upper = symbol.upper()
+    base_c, _, _ = NewsFetcher.map_symbol_currencies(symbol)
+    clean = re.sub(r"[^A-Z0-9]", "", symbol.upper())
 
-    if any(k in symbol_upper for k in ["XAU", "XPT", "XPD", "BTC", "ETH", "SOL", "BNB", "AVAX"]):
-        multiplier = 0.12
-    elif any(k in symbol_upper for k in ["30", "TEC", "500", "DE30", "FR40", "UK100", "JP225", "HK50", "AU200", "OIL", "XNG", "XCU"]):
+    if base_c == "IDX" or any(k in clean for k in ("USOIL", "UKOIL", "WTI", "BRENT", "XTI", "XBR", "XNG", "XCU")):
         multiplier = 0.20
-    elif any(k in symbol_upper for k in ["XRP", "ADA", "DOGE", "LINK", "DOT"]):
+    elif base_c in {"XAU", "XAG", "XPT", "XPD", "BTC", "XBT", "ETH", "SOL", "BNB", "AVAX", "LTC", "BCH"}:
+        multiplier = 0.12
+    elif base_c in {"XRP", "ADA", "DOGE", "LINK", "DOT"}:
         multiplier = 0.15
     else:
         multiplier = 0.10
@@ -891,6 +962,9 @@ class Broker:
         if not self.mt5.initialize(**options):
             raise FatalError("MT5 initialization failed.")
         self._server_offset_sec = 0.0
+        self.active_symbols = list(CFG.SYMBOLS)
+        self.base_symbol_map = {s: s for s in CFG.SYMBOLS}
+        self._dom_cache = {}
 
     def constant(self, name):
         return int(getattr(self.mt5, name))
@@ -1090,8 +1164,24 @@ class Broker:
             raise SafetyError("Margin calculation is unavailable.")
         return float(value)
 
+    def market_book(self, symbol, ttl_sec=5.0):
+        now = time.time()
+        cached = self._dom_cache.get(symbol)
+        if cached is not None and (now - cached[0]) <= ttl_sec:
+            return cached[1]
+        book = self.read(f"mt5.market_book_get({symbol!r})")
+        self._dom_cache[symbol] = (now, book)
+        return book
+
+    def spread_limit_for(self, symbol):
+        if symbol in CFG.MAX_SPREAD_BY_SYMBOL:
+            return float(CFG.MAX_SPREAD_BY_SYMBOL[symbol])
+        base_sym = self.base_symbol_map.get(symbol, symbol)
+        return float(CFG.MAX_SPREAD_BY_SYMBOL.get(base_sym, CFG.MAX_SPREAD_POINTS))
+
     def select_symbols(self):
         valid_symbols = []
+        base_map = {}
         disabled_mode = self.constant("SYMBOL_TRADE_MODE_DISABLED")
         closeonly_mode = self.constant("SYMBOL_TRADE_MODE_CLOSEONLY")
 
@@ -1111,15 +1201,18 @@ class Broker:
 
             if chosen is not None:
                 if chosen != symbol:
-                    print(f"--- [INFO] Auto-mapped symbol {symbol} -> {chosen} (tradable). ---", flush=True)
+                    log(f"Auto-mapped symbol {symbol} -> {chosen} (tradable).")
                 if chosen not in valid_symbols:
                     valid_symbols.append(chosen)
+                    base_map[chosen] = symbol
             else:
-                print(f"--- [WARNING] Symbol {symbol} is unavailable or trade_mode=DISABLED and will be skipped. ---", flush=True)
+                log(f"Symbol {symbol} is unavailable or disabled and will be skipped.", level=logging.WARNING)
 
-        CFG.SYMBOLS = valid_symbols
-        if not CFG.SYMBOLS:
+        self.active_symbols = valid_symbols
+        self.base_symbol_map = base_map
+        if not self.active_symbols:
             raise FatalError("No valid symbols could be selected.")
+        return list(self.active_symbols)
 
     def shutdown(self):
         self.mt5.shutdown()
@@ -2023,7 +2116,11 @@ def scan_symbol(broker, symbol, state):
 
         candidate["score"] = candidate.get("score", 6.0) + score_boost
 
-        news_sentiment = get_news_sentiment_score(symbol, candidate["side"], m5_bars=m5)
+        news_sentiment = (
+            news_catalyst
+            if candidate["side"] == side
+            else get_news_sentiment_score(symbol, candidate["side"], m5_bars=m5)
+        )
         candidate["score"] += news_sentiment
 
     mom_min_threshold = max(CFG.MIN_SCORING_THRESHOLD + 1.5, 7.5)
@@ -2234,7 +2331,11 @@ def build_order(broker, candidate, account):
     if int(info["trade_mode"]) not in allowed_modes:
         return reject(f"Broker trade mode blocked (mode={info['trade_mode']})")
 
-    base_spread_limit = float(CFG.MAX_SPREAD_BY_SYMBOL.get(symbol, CFG.MAX_SPREAD_POINTS))
+    base_spread_limit = (
+        broker.spread_limit_for(symbol)
+        if hasattr(broker, "spread_limit_for")
+        else float(CFG.MAX_SPREAD_BY_SYMBOL.get(symbol, CFG.MAX_SPREAD_POINTS))
+    )
     spread_limit = base_spread_limit * (1.20 if is_prime_killzone_utc() else 1.0)
     current_spread = spread_points(tick, info)
     if current_spread > spread_limit:
@@ -2427,7 +2528,7 @@ def mark_halt(state, path, reason):
     if not state["halt_reason"]:
         state["halt_reason"] = reason
         atomic_save(path, state)
-        notify(f"Safety halt activated. Reason: {reason}")
+        notify(f"Safety halt activated. Reason: {reason}", critical=True)
 
 
 def execute_request(broker, state, path, kind, request, metadata):
@@ -2461,7 +2562,8 @@ def execute_request(broker, state, path, kind, request, metadata):
     except Exception:
         notify(
             "Execution status is unknown. "
-            "Further requests are blocked pending reconciliation."
+            "Further requests are blocked pending reconciliation.",
+            critical=True,
         )
         return True
 
@@ -3162,8 +3264,9 @@ def daily_snapshot(broker, state, path):
     }
 
 
-def in_session():
-    has_crypto = any(is_crypto_symbol(s) for s in CFG.SYMBOLS)
+def in_session(symbols=None):
+    active_list = symbols if symbols is not None else CFG.SYMBOLS
+    has_crypto = any(is_crypto_symbol(s) for s in active_list)
     if is_friday_weekend_close_window() and not has_crypto:
         return False
     if utc_now().weekday() >= 5 and has_crypto:
@@ -3228,7 +3331,8 @@ def entry_permission(broker, state, snapshot, positions, orders):
     if any(int(order.get("magic", 0)) == CFG.MAGIC for order in orders):
         return False, "A bot order is still active."
 
-    if not in_session():
+    active_syms = getattr(broker, "active_symbols", CFG.SYMBOLS)
+    if not in_session(active_syms):
         return False, "The entry session is closed."
 
     account = snapshot["account"]
@@ -3630,13 +3734,10 @@ def main():
     validate_config()
     broker = None
 
+    root_logger, formatter = _configure_logging()
     if CFG.TELEGRAM_TOKEN and CFG.TELEGRAM_CHAT_ID:
-        root_logger = logging.getLogger()
-        root_logger.setLevel(logging.INFO)
-        
         if not any(isinstance(h, TelegramLogHandler) for h in root_logger.handlers):
             tg_handler = TelegramLogHandler()
-            formatter = logging.Formatter("%(asctime)s UTC | %(levelname)s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
             tg_handler.setFormatter(formatter)
             root_logger.addHandler(tg_handler)
 
@@ -3680,10 +3781,11 @@ def main():
             )
 
         last_weekend_notify_date = None
+        consecutive_runtime_errors = 0
 
         while True:
             try:
-                if is_weekend():
+                if is_weekend(broker.active_symbols):
                     current_date = datetime.now(timezone.utc).date()
                     
                     if last_weekend_notify_date != current_date:
@@ -3743,7 +3845,8 @@ def main():
                         or is_friday_weekend_close_window(None)
                     )
 
-                    for symbol in CFG.SYMBOLS:
+                    logging.debug("Scanning %d active symbol(s)...", len(broker.active_symbols))
+                    for symbol in broker.active_symbols:
                         if symbol in active_symbols:
                             continue
                         if is_fx_weekend_closed and not is_crypto_symbol(symbol):
@@ -3756,7 +3859,7 @@ def main():
                             news_blocked_symbols.append(symbol)
                             continue
 
-                        print(f"--- [SCANNING] Checking symbol: {symbol} ---", flush=True)
+                        logging.debug("Checking symbol: %s", symbol)
                         candidate = scan_symbol(broker, symbol, state)
 
                         if candidate is not None:
@@ -3892,6 +3995,7 @@ def main():
                         if submitted:
                             break
 
+                consecutive_runtime_errors = 0
                 time.sleep(CFG.POLL_SECONDS)
 
             except FatalError:
@@ -3911,14 +4015,19 @@ def main():
 
             except Exception as e:
                 import traceback
-                error_msg = f"Unexpected error: {str(e)}\n{traceback.format_exc()}"
-                log(error_msg)
-                notify(error_msg)
-                status(
-                    "unexpected_cycle_error",
-                    "An unexpected runtime error occurred.",
-                    60,
+                consecutive_runtime_errors += 1
+                max_err = int(getattr(CFG, "MAX_CONSECUTIVE_RUNTIME_ERRORS", 5))
+                error_msg = (
+                    f"Unexpected error ({consecutive_runtime_errors}/{max_err}): "
+                    f"{str(e)}\n{traceback.format_exc()}"
                 )
+                notify(error_msg, critical=True)
+                if consecutive_runtime_errors >= max_err:
+                    mark_halt(
+                        state,
+                        state_path,
+                        f"Repeated runtime exceptions ({consecutive_runtime_errors} consecutive).",
+                    )
                 time.sleep(CFG.POLL_SECONDS)
 
     finally:
@@ -3942,12 +4051,13 @@ if __name__ == "__main__":
         )
 
     except FatalError as error:
-        notify(str(error))
+        notify(str(error), critical=True)
         sys.exit(1)
 
     except Exception:
         notify(
             "SMC bot stopped because initialization or execution failed. "
-            "No external exception details were forwarded."
+            "No external exception details were forwarded.",
+            critical=True,
         )
         sys.exit(1)

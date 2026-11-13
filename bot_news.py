@@ -8,11 +8,6 @@ import time
 import requests
 import bot_config as CFG
 
-logging.Formatter.converter = time.gmtime
-logging.basicConfig(
-    level=logging.WARNING,
-    format="%(asctime)s UTC | %(levelname)s | %(message)s",
-)
 log = logging.getLogger("NewsFetcher")
 
 INVERSE_ECONOMIC_KEYWORDS = (
@@ -310,7 +305,7 @@ class NewsFetcher:
             base_cur, quote_cur = "IDX", "CNY"
 
         direct = {c for c in (base_cur, quote_cur) if c and c != "IDX"}
-        if base_cur in {"IDX", "XAU", "XAG", "XPT", "XPD", "BTC", "ETH", "SOL", "XRP", "BNB", "ADA", "DOGE", "LINK", "DOT"}:
+        if base_cur in {"IDX", "XAU", "XAG", "XPT", "XPD", "BTC", "XBT", "ETH", "SOL", "XRP", "BNB", "ADA", "DOGE", "LINK", "DOT", "AVAX", "LTC", "BCH"}:
             direct.add("USD")
         direct.add("ALL")
 
