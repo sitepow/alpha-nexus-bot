@@ -23,6 +23,45 @@ INVERSE_ECONOMIC_KEYWORDS = (
     "layoffs",
 )
 
+SUPER_HIGH_IMPACT_KEYWORDS = (
+    "non-farm",
+    "nonfarm",
+    "fomc",
+    "fed interest rate",
+    "federal funds rate",
+    "powell",
+    "cpi",
+    "core pce",
+    "ecb press conference",
+    "interest rate decision",
+    "official bank rate",
+    "boj policy rate",
+)
+
+
+def is_super_high_impact(title: str) -> bool:
+    if not title:
+        return False
+    lower_title = str(title).lower()
+    return any(keyword in lower_title for keyword in SUPER_HIGH_IMPACT_KEYWORDS)
+
+
+def parse_calendar_utc(time_str: str):
+    if not time_str or not isinstance(time_str, str):
+        return None
+    text = time_str.strip()
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if dt.tzinfo is not None:
+            return dt.astimezone(timezone.utc).replace(tzinfo=None)
+        return dt
+    except ValueError:
+        pass
+    try:
+        return datetime.strptime(text[:19], "%Y-%m-%dT%H:%M:%S")
+    except (TypeError, ValueError):
+        return None
+
 def parse_economic_number(raw_value):
     if raw_value is None:
         return None
@@ -229,9 +268,8 @@ class NewsFetcher:
                 continue
 
             time_str = item.get("date")
-            try:
-                news_time = datetime.strptime(time_str[:19], "%Y-%m-%dT%H:%M:%S")
-            except (TypeError, ValueError):
+            news_time = parse_calendar_utc(time_str)
+            if news_time is None:
                 continue
 
             if news_time >= now - timedelta(hours=CFG.NEWS_LOOKBACK_HOURS):
@@ -258,20 +296,23 @@ class NewsFetcher:
         base_cur = clean[:3] if len(clean) >= 3 else ""
         quote_cur = clean[3:6] if len(clean) >= 6 else "USD"
 
-        if any(idx in clean for idx in ("US30", "USTEC", "US500", "USOIL", "XNG")):
+        if any(idx in clean for idx in ("US30", "DJ30", "USTEC", "NAS100", "US100", "US500", "SPX500", "US2000", "USOIL", "WTI", "XTI", "XNG")):
             base_cur, quote_cur = "IDX", "USD"
-        elif "UK100" in clean or "UKOIL" in clean:
+        elif any(idx in clean for idx in ("UK100", "FTSE100", "UKOIL", "BRENT", "XBR")):
             base_cur, quote_cur = "IDX", "GBP"
-        elif "DE30" in clean or "FR40" in clean:
+        elif any(idx in clean for idx in ("DE30", "DE40", "GER30", "GER40", "DAX", "FR40", "EU50", "STOXX50")):
             base_cur, quote_cur = "IDX", "EUR"
-        elif "JP225" in clean:
+        elif any(idx in clean for idx in ("JP225", "JPN225", "NIKKEI")):
             base_cur, quote_cur = "IDX", "JPY"
-        elif "AUS200" in clean:
+        elif any(idx in clean for idx in ("AUS200", "AU200")):
             base_cur, quote_cur = "IDX", "AUD"
+        elif any(idx in clean for idx in ("HK50", "HSI", "CN50", "CHINA50")):
+            base_cur, quote_cur = "IDX", "CNY"
 
-        direct = {c for c in (base_cur, quote_cur) if c}
-        if base_cur in {"XAU", "XAG", "XPT", "XPD", "BTC", "ETH", "SOL", "XRP", "BNB", "ADA", "DOGE", "LINK", "DOT"}:
+        direct = {c for c in (base_cur, quote_cur) if c and c != "IDX"}
+        if base_cur in {"IDX", "XAU", "XAG", "XPT", "XPD", "BTC", "ETH", "SOL", "XRP", "BNB", "ADA", "DOGE", "LINK", "DOT"}:
             direct.add("USD")
+        direct.add("ALL")
 
         return base_cur, quote_cur, direct
 
@@ -283,6 +324,8 @@ class NewsFetcher:
 
         high_before = float(getattr(CFG, "NEWS_BEFORE_MINUTES", buffer_minutes))
         high_after = float(getattr(CFG, "NEWS_AFTER_MINUTES", 10.0))
+        super_before = float(getattr(CFG, "NEWS_SUPER_HIGH_BEFORE_MINUTES", 35.0))
+        super_after = float(getattr(CFG, "NEWS_SUPER_HIGH_AFTER_MINUTES", 15.0))
         med_before = float(getattr(CFG, "NEWS_MEDIUM_BEFORE_MINUTES", 10.0))
         med_after = float(getattr(CFG, "NEWS_MEDIUM_AFTER_MINUTES", 5.0))
 
@@ -292,8 +335,16 @@ class NewsFetcher:
                     continue
 
                 is_high = (news["impact"] == "High")
-                before_window = max(float(buffer_minutes), high_before) if is_high else med_before
-                after_window = high_after if is_high else med_after
+                is_super = is_high and is_super_high_impact(news.get("title", ""))
+                if is_super:
+                    before_window = max(float(buffer_minutes), high_before, super_before)
+                    after_window = max(high_after, super_after)
+                elif is_high:
+                    before_window = max(float(buffer_minutes), high_before)
+                    after_window = high_after
+                else:
+                    before_window = med_before
+                    after_window = med_after
 
                 minutes_until = (news["time"] - now).total_seconds() / 60.0
                 if -after_window <= minutes_until <= before_window:

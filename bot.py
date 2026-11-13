@@ -65,9 +65,33 @@ try:
 except ImportError:
     fcntl = None
 
+def is_crypto_symbol(symbol):
+    clean = re.sub(r"[^A-Z0-9]", "", str(symbol).upper())
+    return clean.startswith(("BTC", "ETH", "SOL", "XRP", "BNB", "ADA", "DOGE", "LINK", "DOT", "AVAX"))
+
+
 def is_weekend():
     current_utc_time = datetime.now(timezone.utc)
-    return current_utc_time.weekday() >= 5
+    if current_utc_time.weekday() < 5:
+        return False
+    if current_utc_time.weekday() == 6 and current_utc_time.hour >= 22:
+        return False
+    return not any(is_crypto_symbol(sym) for sym in CFG.SYMBOLS)
+
+
+def is_monday_opening_gap_window(symbol):
+    if is_crypto_symbol(symbol):
+        return False
+    cooldown_mins = int(getattr(CFG, "MONDAY_OPEN_COOLDOWN_MINUTES", 30))
+    if cooldown_mins <= 0:
+        return False
+    now = utc_now()
+    if now.weekday() == 6 and now.hour >= 21:
+        minutes_since_reopen = (now.hour - 22) * 60 + now.minute
+        return minutes_since_reopen < cooldown_mins
+    if now.weekday() == 0 and now.hour == 0 and now.minute < cooldown_mins:
+        return True
+    return False
 
 _TELEGRAM_QUEUE = queue.Queue(maxsize=500)
 
@@ -306,11 +330,13 @@ def scan_momentum_breakout_candidate(broker, symbol, m5_bars, side, volatility):
     else:
         zone = {"kind": "MOMENTUM_BIGBELUGA", "side": "SELL", "bottom": latest["close"], "top": extreme}
 
+    recent_vol_floor = max(volatility[-1], max(volatility[-24:]) * 0.85) if len(volatility) >= 24 else volatility[-1]
     return {
         "zone": zone,
         "side": side,
         "extreme": extreme,
         "atr": volatility[-1],
+        "sl_floor_atr": recent_vol_floor,
         "signal_close": latest["close"],
         "signal_time": int(latest["time"] + 300),
         "score": final_score,
@@ -864,6 +890,7 @@ class Broker:
 
         if not self.mt5.initialize(**options):
             raise FatalError("MT5 initialization failed.")
+        self._server_offset_sec = 0.0
 
     def constant(self, name):
         return int(getattr(self.mt5, name))
@@ -905,11 +932,23 @@ class Broker:
     def info(self, symbol):
         return self.named(f"mt5.symbol_info({symbol!r})")
 
+    def update_server_offset(self, raw_server_ts):
+        diff = float(raw_server_ts) - time.time()
+        nearest_half_hour = round(diff / 1800.0) * 1800.0
+        if abs(nearest_half_hour) <= 14 * 3600 and abs(diff - nearest_half_hour) <= 300:
+            self._server_offset_sec = float(nearest_half_hour)
+        return self._server_offset_sec
+
+    def to_utc_ts(self, server_ts):
+        return float(server_ts) - float(getattr(self, "_server_offset_sec", 0.0))
+
     def tick(self, symbol):
         tick = self.named(f"mt5.symbol_info_tick({symbol!r})")
         bid = float(tick["bid"])
         ask = float(tick["ask"])
-        stamp = tick_timestamp(tick)
+        raw_stamp = tick_timestamp(tick)
+        self.update_server_offset(raw_stamp)
+        stamp = self.to_utc_ts(raw_stamp)
         age = time.time() - stamp
 
         if (
@@ -936,18 +975,25 @@ class Broker:
         )
 
     def history(self, start, end):
+        offset = float(getattr(self, "_server_offset_sec", 0.0))
+        q_start = float(start) + min(0.0, offset) - 60.0
+        q_end = float(end) + max(0.0, offset) + 60.0
         module = "__import__('datetime')"
         first = (
             f"{module}.datetime.fromtimestamp("
-            f"{float(start)}, tz={module}.timezone.utc)"
+            f"{q_start}, tz={module}.timezone.utc)"
         )
         last = (
             f"{module}.datetime.fromtimestamp("
-            f"{float(end)}, tz={module}.timezone.utc)"
+            f"{q_end}, tz={module}.timezone.utc)"
         )
-        return self.records(
+        raw_deals = self.records(
             f"mt5.history_deals_get({first}, {last})"
         )
+        return [
+            d for d in raw_deals
+            if float(start) <= self.to_utc_ts(float(d.get("time", 0.0))) <= float(end)
+        ]
 
     def bars(self, symbol, timeframe, count):
         expression = (
@@ -970,7 +1016,16 @@ class Broker:
 
         previous = None
 
+        if values and getattr(self, "_server_offset_sec", 0.0) == 0.0:
+            try:
+                raw_tick = self.named(f"mt5.symbol_info_tick({symbol!r})")
+                self.update_server_offset(tick_timestamp(raw_tick))
+            except Exception:
+                pass
+
+        offset_int = int(round(getattr(self, "_server_offset_sec", 0.0)))
         for bar in values:
+            bar["time"] = int(bar["time"]) - offset_int
             if previous is not None and bar["time"] <= previous:
                 raise SafetyError("Invalid market-bar timestamps.")
             previous = bar["time"]
@@ -1274,12 +1329,13 @@ def check_harmonic_bat_pattern(bars, side):
         C = highs[-1]["price"]
         D = bars[-1]["low"]
 
+        if not (lows[-3]["index"] < highs[-2]["index"] < lows[-2]["index"] < highs[-1]["index"]):
+            return False
+
         XA = A - X
         AB = A - B
-        XC = C - X
-        XD = C - D
 
-        if XA <= 0 or AB <= 0 or XC <= 0:
+        if XA <= 0 or AB <= 0 or C > A:
             return False
 
         b_ratio = (A - B) / XA
@@ -1298,11 +1354,13 @@ def check_harmonic_bat_pattern(bars, side):
         C = lows[-1]["price"]
         D = bars[-1]["high"]
 
+        if not (highs[-3]["index"] < lows[-2]["index"] < highs[-2]["index"] < lows[-1]["index"]):
+            return False
+
         XA = X - A
         AB = B - A
-        XC = X - C
 
-        if XA <= 0 or AB <= 0 or XC <= 0:
+        if XA <= 0 or AB <= 0 or C < A:
             return False
 
         b_ratio = (B - A) / XA
@@ -1354,7 +1412,8 @@ def calculate_scoring_logic(broker, bars, zone, sweep_bar, confirmation_bar, ref
             score += 2.0
 
     if getattr(CFG, "ENABLE_HARMONIC_BAT", True):
-        if check_harmonic_bat_pattern(bars, zone["side"]):
+        bars_upto_conf = bars[:conf_idx + 1] if (conf_idx is not None and conf_idx >= 0) else bars
+        if check_harmonic_bat_pattern(bars_upto_conf, zone["side"]):
             score += getattr(CFG, "HARMONIC_SCORE_BOOST", 2.0)
 
     symbol = zone.get("symbol", "EURUSD")
@@ -1717,11 +1776,13 @@ def zone_signal(zone, bars, volatility, pdh=None, pdl=None, broker=None):
             path = bars[touch:confirmation_index + 1]
             extreme = min(item["low"] for item in path) if buy else max(item["high"] for item in path)
 
+            recent_vol_floor = max(volatility[-1], max(volatility[-24:]) * 0.85) if len(volatility) >= 24 else volatility[-1]
             return {
                 "zone": zone,
                 "side": zone["side"],
                 "extreme": extreme,
                 "atr": volatility[-1],
+                "sl_floor_atr": recent_vol_floor,
                 "signal_close": bar["close"],
                 "signal_time": int(bar["time"] + 300),
                 "sweep_time": int(sweep_bar["time"] + 300),
@@ -1765,6 +1826,7 @@ def get_news_sentiment_score(symbol, side, m5_bars=None):
     sentiment_score = 0.0
     max_boost = float(getattr(CFG, "NEWS_SCORE_BOOST_HIGH", 3.0)) * 1.15
     max_penalty = float(getattr(CFG, "NEWS_HIGH_IMPACT_PENALTY", 4.0))
+    seen_price_fallback_ts = set()
 
     with SHARED_NEWS_FETCHER._lock:
         for news in SHARED_NEWS_FETCHER.high_impact_news:
@@ -1814,6 +1876,9 @@ def get_news_sentiment_score(symbol, side, m5_bars=None):
 
             elif m5_bars and len(m5_bars) >= 3:
                 release_ts = int(news_time.replace(tzinfo=timezone.utc).timestamp())
+                if release_ts in seen_price_fallback_ts:
+                    continue
+                seen_price_fallback_ts.add(release_ts)
                 reaction_bars = [b for b in m5_bars if release_ts <= b["time"] <= release_ts + 900]
                 if reaction_bars:
                     open_p = reaction_bars[0]["open"]
@@ -1940,7 +2005,7 @@ def scan_symbol(broker, symbol, state):
         m15_bonus = m15_confirmation(candidate, m15)
         score_boost = m15_bonus
 
-        if pdh is not None and pdl is not None:
+        if kind != "smc" and pdh is not None and pdl is not None:
             if candidate["side"] == "SELL" and current_price >= pdh - (volatility[-1] * 1.5):
                 score_boost += 2.0
             elif candidate["side"] == "BUY" and current_price <= pdl + (volatility[-1] * 1.5):
@@ -2144,6 +2209,9 @@ def build_order(broker, candidate, account):
         candidate["_permanent_reject"] = permanent
         return None
 
+    if is_monday_opening_gap_window(symbol):
+        return reject("Monday market-open gap cooldown active", permanent=False)
+
     allowed, reason = news_permission(broker, symbol)
     if not allowed:
         return reject(f"News restriction ({reason})", permanent=False)
@@ -2151,7 +2219,7 @@ def build_order(broker, candidate, account):
     info = broker.info(symbol)
     tick = broker.tick(symbol)
 
-    if tick_timestamp(tick) < candidate["signal_time"]:
+    if broker.to_utc_ts(tick_timestamp(tick)) < candidate["signal_time"]:
         candidate["_permanent_reject"] = False
         return None
 
@@ -2183,13 +2251,13 @@ def build_order(broker, candidate, account):
         return reject(f"Entry drift too high ({drift:.5f} > Max: {max_drift:.5f})", permanent=False)
 
     zone = candidate["zone"]
+    floor_atr = max(volatility, float(candidate.get("sl_floor_atr", volatility)))
     buffer = CFG.SL_BUFFER_ATR * volatility
     gap = stop_gap(info)
-    min_smc_sl_dist = (
-        float(getattr(CFG, "MIN_SMC_SL_ATR", 1.30)) * volatility
-        if zone.get("kind") != "MOMENTUM_BIGBELUGA"
-        else 0.0
-    )
+    if zone.get("kind") != "MOMENTUM_BIGBELUGA":
+        min_smc_sl_dist = float(getattr(CFG, "MIN_SMC_SL_ATR", 1.30)) * floor_atr
+    else:
+        min_smc_sl_dist = float(getattr(CFG, "MIN_MOMENTUM_SL_ATR", 1.10)) * floor_atr
 
     if buy:
         raw_sl = min(zone["bottom"], candidate["extreme"]) - buffer
@@ -2566,7 +2634,7 @@ def resolve_pending(broker, state, path):
                     "initial_tp": float(request["tp"]),
                     "partial_done": False,
                     "opened_at": min(
-                        float(deal["time"]) for deal in entries
+                        broker.to_utc_ts(float(deal["time"])) for deal in entries
                     ),
                     "zone_id": pending["metadata"]["zone_id"],
                 }
@@ -2668,6 +2736,54 @@ def resolve_pending(broker, state, path):
         atomic_save(path, state)
         notify(f"Execution rejected. Action: {kind}. Code: {code}")
         return
+
+    pending_age = time.time() - float(pending.get("created", time.time()))
+    stale_timeout = float(getattr(CFG, "PENDING_STALE_RECONCILE_SECONDS", 90.0))
+
+    if pending.get("result") is None and pending_age >= stale_timeout:
+        if kind in {"PARTIAL", "FULL_CLOSE"}:
+            pid = pending["metadata"]["position_id"]
+            live_pos = next(
+                (item for item in positions if position_identifier(item) == pid),
+                None,
+            )
+            record = state["positions"].get(pid)
+            if live_pos is None:
+                state["pending"] = None
+                atomic_save(path, state)
+                notify(f"Stale {kind} cleared: position {pid} is already closed.")
+                return
+            if (
+                kind == "PARTIAL"
+                and record is not None
+                and float(live_pos["volume"]) < float(record["initial_volume"]) - CFG.EPSILON
+            ):
+                record["partial_done"] = True
+                state["pending"] = None
+                atomic_save(path, state)
+                notify(f"Stale PARTIAL reconciled via live volume reduction on {request['symbol']}.")
+                return
+            state["pending"] = None
+            atomic_save(path, state)
+            notify(f"Stale unacknowledged {kind} cleared after {pending_age:.0f}s (no broker order/deal found).")
+            return
+
+        if kind == "MODIFY_SL":
+            state["pending"] = None
+            atomic_save(path, state)
+            notify(f"Stale unacknowledged MODIFY_SL cleared after {pending_age:.0f}s.")
+            return
+
+        if kind == "ENTRY":
+            sym_has_bot_pos = any(
+                item["symbol"] == request["symbol"] and int(item.get("magic", 0)) == CFG.MAGIC
+                for item in positions
+            )
+            if not sym_has_bot_pos:
+                state["pending"] = None
+                atomic_save(path, state)
+                notify(f"Stale unacknowledged ENTRY cleared after {pending_age:.0f}s (no open position or deal).")
+                return
 
     status(
         "pending_execution",
@@ -2843,7 +2959,7 @@ def reconcile_positions(broker, state, path):
         pnl = sum(deal_cash(deal) for deal in deals)
 
         closed.append((
-            float(last_exit["time"]),
+            broker.to_utc_ts(float(last_exit["time"])),
             int(last_exit["ticket"]),
             pid,
             record,
@@ -2884,7 +3000,9 @@ def reconcile_positions(broker, state, path):
 
     return positions
 
-def is_friday_weekend_close_window():
+def is_friday_weekend_close_window(symbol=None):
+    if symbol is not None and is_crypto_symbol(symbol):
+        return False
     if not getattr(CFG, "ENABLE_FRIDAY_WEEKEND_EXIT", True):
         return False
     now = utc_now()
@@ -3045,8 +3163,11 @@ def daily_snapshot(broker, state, path):
 
 
 def in_session():
-    if is_friday_weekend_close_window():
+    has_crypto = any(is_crypto_symbol(s) for s in CFG.SYMBOLS)
+    if is_friday_weekend_close_window() and not has_crypto:
         return False
+    if utc_now().weekday() >= 5 and has_crypto:
+        return True
 
     hour = utc_now().hour
 
@@ -3266,7 +3387,7 @@ def manage_positions(broker, state, path):
         else:
             effective_exit_min = base_exit_min
 
-        if is_friday_weekend_close_window():
+        if is_friday_weekend_close_window(symbol):
             request = partial_request(broker, position, volume)
             execute_request(
                 broker,
@@ -3615,8 +3736,19 @@ def main():
                     active_symbols = {item["symbol"] for item in positions + orders}
                     news_blocked_symbols = []
 
+                    now_utc_scan = utc_now()
+                    is_fx_weekend_closed = (
+                        now_utc_scan.weekday() == 5
+                        or (now_utc_scan.weekday() == 6 and now_utc_scan.hour < 22)
+                        or is_friday_weekend_close_window(None)
+                    )
+
                     for symbol in CFG.SYMBOLS:
                         if symbol in active_symbols:
+                            continue
+                        if is_fx_weekend_closed and not is_crypto_symbol(symbol):
+                            continue
+                        if is_monday_opening_gap_window(symbol):
                             continue
 
                         news_ok, news_reason = news_permission(broker, symbol)
