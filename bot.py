@@ -1684,6 +1684,14 @@ def zone_signal(zone, bars, volatility, pdh=None, pdl=None, broker=None):
             if confirmation_index < latest:
                 break
 
+            m5_closes_up_to_conf = [b["close"] for b in bars[:confirmation_index + 1]]
+            if len(m5_closes_up_to_conf) >= 20:
+                m5_ema20_now = ema(m5_closes_up_to_conf, 20)[-1]
+                if buy and bar["close"] < m5_ema20_now:
+                    continue
+                if not buy and bar["close"] > m5_ema20_now:
+                    continue
+
             conf_modifier = sweep_modifier
             reference = volatility[confirmation_index - 1]
             close_buffer = CFG.CONFIRM_CLOSE_BUFFER_ATR * reference
@@ -1859,7 +1867,26 @@ def scan_symbol(broker, symbol, state):
 
     news_catalyst = get_news_sentiment_score(symbol, side, m5_bars=m5)
 
-    if regime != "RANGING_SIDEWAY":
+    m15_counter_knife = False
+    if regime == "RETRACEMENT_SMC" and len(m15) >= 15:
+        m15_atr_vals = atr(m15)
+        ref_m15_atr = m15_atr_vals[-2] if len(m15_atr_vals) >= 2 and m15_atr_vals[-2] > 0 else (m15_atr_vals[-1] if m15_atr_vals else 0.0)
+        max_counter_atr = float(getattr(CFG, "MAX_COUNTER_M15_IMPULSE_ATR", 1.20))
+        if ref_m15_atr > 0:
+            last_m15 = m15[-1]
+            prev_m15 = m15[-2]
+            if side == "BUY":
+                last_bear_body = max(0.0, last_m15["open"] - last_m15["close"])
+                two_bar_bear_drop = max(0.0, prev_m15["open"] - last_m15["close"]) if (last_m15["close"] < last_m15["open"] and prev_m15["close"] < prev_m15["open"]) else 0.0
+                if last_bear_body >= ref_m15_atr * max_counter_atr or two_bar_bear_drop >= ref_m15_atr * (max_counter_atr * 1.35):
+                    m15_counter_knife = True
+            else:
+                last_bull_body = max(0.0, last_m15["close"] - last_m15["open"])
+                two_bar_bull_jump = max(0.0, last_m15["close"] - prev_m15["open"]) if (last_m15["close"] > last_m15["open"] and prev_m15["close"] > prev_m15["open"]) else 0.0
+                if last_bull_body >= ref_m15_atr * max_counter_atr or two_bar_bull_jump >= ref_m15_atr * (max_counter_atr * 1.35):
+                    m15_counter_knife = True
+
+    if regime != "RANGING_SIDEWAY" and not m15_counter_knife:
         for zone in create_zones(symbol, m15, side):
             zone_id = f"{symbol}:{zone['local_id']}"
 
@@ -2130,9 +2157,16 @@ def build_order(broker, candidate, account):
     zone = candidate["zone"]
     buffer = CFG.SL_BUFFER_ATR * volatility
     gap = stop_gap(info)
+    min_smc_sl_dist = (
+        float(getattr(CFG, "MIN_SMC_SL_ATR", 1.30)) * volatility
+        if zone.get("kind") != "MOMENTUM_BIGBELUGA"
+        else 0.0
+    )
 
     if buy:
         raw_sl = min(zone["bottom"], candidate["extreme"]) - buffer
+        if min_smc_sl_dist > 0:
+            raw_sl = min(raw_sl, entry - min_smc_sl_dist)
         raw_sl = min(raw_sl, float(tick["bid"]) - gap)
         stop = price_round(raw_sl, info)
         risk_distance = entry - stop
@@ -2140,6 +2174,8 @@ def build_order(broker, candidate, account):
     else:
         spread_price = float(tick["ask"]) - float(tick["bid"])
         raw_sl = max(zone["top"], candidate["extreme"]) + buffer + spread_price
+        if min_smc_sl_dist > 0:
+            raw_sl = max(raw_sl, entry + min_smc_sl_dist + spread_price)
         raw_sl = max(raw_sl, float(tick["ask"]) + gap)
         stop = price_round(raw_sl, info, upward=True)
         risk_distance = stop - entry
