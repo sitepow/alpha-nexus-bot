@@ -180,6 +180,8 @@ if CFG.TELEGRAM_TOKEN and CFG.TELEGRAM_CHAT_ID:
 class TelegramLogHandler(logging.Handler):
     def emit(self, record):
         try:
+            if record.name == "NewsFetcher" and record.levelno < logging.ERROR:
+                return
             log_entry = self.format(record)
             if record.levelno >= logging.WARNING:
                 send_telegram_log_async(log_entry, critical=True)
@@ -218,6 +220,9 @@ SHARED_NEWS_FETCHER.start()
 LOCK_HANDLE = None
 LAST_STATUS = {}
 NOTIFIED_ZONES = set()
+SYMBOL_RADAR_STATE = {}
+LAST_RADAR_SIGNATURE = ""
+LAST_RADAR_SENT_TS = 0.0
 
 
 class SafetyError(RuntimeError):
@@ -2036,18 +2041,50 @@ def scan_symbol(broker, symbol, state):
     side = htf_bias(h4)
 
     if side == "NEUTRAL" or len(m15) < CFG.DEALING_RANGE_BARS + 10:
+        SYMBOL_RADAR_STATE[symbol] = {
+            "category": "BLOCKED",
+            "side": "NEUTRAL",
+            "regime": regime,
+            "stage": "H4_NEUTRAL",
+            "detail": "H4 structure neutral",
+        }
         return None
 
     volatility = atr(m5)
     current_price = m5[-1]["close"]
+    ref_m5_atr = volatility[-1] if volatility and volatility[-1] > 0 else 0.0
 
     m15_closes = [bar["close"] for bar in m15]
     if len(m15_closes) >= 200:
         m15_ema200_now = ema(m15_closes, 200)[-1]
         if side == "BUY" and (m15[-1]["close"] < m15_ema200_now or current_price < m15_ema200_now):
+            SYMBOL_RADAR_STATE[symbol] = {
+                "category": "BLOCKED",
+                "side": side,
+                "regime": regime,
+                "stage": "M15_EMA200_CONFLICT",
+                "detail": "H4 BUY vs M15 below EMA200",
+            }
             return None
         if side == "SELL" and (m15[-1]["close"] > m15_ema200_now or current_price > m15_ema200_now):
+            SYMBOL_RADAR_STATE[symbol] = {
+                "category": "BLOCKED",
+                "side": side,
+                "regime": regime,
+                "stage": "M15_EMA200_CONFLICT",
+                "detail": "H4 SELL vs M15 above EMA200",
+            }
             return None
+
+    if regime == "RANGING_SIDEWAY":
+        SYMBOL_RADAR_STATE[symbol] = {
+            "category": "BLOCKED",
+            "side": side,
+            "regime": regime,
+            "stage": "RANGING_SIDEWAY",
+            "detail": "Sideways / low efficiency",
+        }
+        return None
 
     candidates = []
 
@@ -2072,12 +2109,23 @@ def scan_symbol(broker, symbol, state):
                 if last_bull_body >= ref_m15_atr * max_counter_atr or two_bar_bull_jump >= ref_m15_atr * (max_counter_atr * 1.35):
                     m15_counter_knife = True
 
+    active_zones = []
     if regime != "RANGING_SIDEWAY" and not m15_counter_knife:
         for zone in create_zones(symbol, m15, side):
             zone_id = f"{symbol}:{zone['local_id']}"
 
             if zone_id in state["seen_zones"]:
                 continue
+
+            invalidation_buf = ref_m5_atr * 0.15
+            eligible_m5 = [b for b in m5 if b["time"] >= zone["created"]]
+            if eligible_m5:
+                broken_zone = any(
+                    (b["close"] < zone["bottom"] - invalidation_buf if side == "BUY" else b["close"] > zone["top"] + invalidation_buf)
+                    for b in eligible_m5
+                )
+                if not broken_zone:
+                    active_zones.append(zone)
 
             sig = zone_signal(zone, m5, volatility, pdh, pdl, broker=broker)
             if sig is not None:
@@ -2091,7 +2139,52 @@ def scan_symbol(broker, symbol, state):
         if mom is not None and mom["side"] == side:
             candidates.append(("momentum", mom))
 
+    def _record_waiting_radar():
+        cat = "STRONG" if regime == "STRONG_TREND" else "NORMAL"
+        if m15_counter_knife:
+            SYMBOL_RADAR_STATE[symbol] = {
+                "category": cat,
+                "side": side,
+                "regime": regime,
+                "stage": "ANTI_KNIFE_WAIT",
+                "detail": f"{symbol} [{side}] | Waiting M15 counter-impulse to cool down",
+            }
+            return
+        if active_zones:
+            def _z_dist(z):
+                if z["bottom"] <= current_price <= z["top"]:
+                    return 0.0
+                return min(abs(current_price - z["top"]), abs(current_price - z["bottom"]))
+            nearest_z = min(active_zones, key=_z_dist)
+            dist = _z_dist(nearest_z)
+            dist_atr = (dist / ref_m5_atr) if ref_m5_atr > 0 else 0.0
+            z_kind = "MIT" if nearest_z["kind"] == "MITIGATION_BLOCK" else nearest_z["kind"]
+            if dist == 0.0 or dist_atr <= 0.35:
+                stage = f"IN_ZONE:{z_kind}"
+                detail = f"{symbol} [{side}] | In {z_kind} zone -> waiting M5 sweep/EMA20 close"
+            elif dist_atr <= 2.5:
+                stage = f"NEAR_ZONE:{z_kind}"
+                detail = f"{symbol} [{side}] | Near {z_kind} ({dist_atr:.1f} ATR away)"
+            else:
+                stage = f"WAIT_PULLBACK:{z_kind}"
+                detail = f"{symbol} [{side}] | Waiting pullback to {z_kind} ({dist_atr:.1f} ATR)"
+        else:
+            if regime == "STRONG_TREND":
+                stage = "WAIT_BREAKOUT_OR_ZONE"
+                detail = f"{symbol} [{side}] | Strong trend -> watching 1H box breakout / new zone"
+            else:
+                stage = "WAIT_NEW_ZONE"
+                detail = f"{symbol} [{side}] | Trend aligned -> waiting new M15 OB/FVG"
+        SYMBOL_RADAR_STATE[symbol] = {
+            "category": cat,
+            "side": side,
+            "regime": regime,
+            "stage": stage,
+            "detail": detail,
+        }
+
     if not candidates:
+        _record_waiting_radar()
         return None
 
     for kind, candidate in candidates:
@@ -2129,6 +2222,7 @@ def scan_symbol(broker, symbol, state):
         if c["score"] >= (CFG.MIN_SCORING_THRESHOLD if k == "smc" else mom_min_threshold)
     ]
     if not eligible:
+        _record_waiting_radar()
         return None
 
     mom_pool = [c for (k, c) in eligible if k == "momentum"]
@@ -2147,6 +2241,13 @@ def scan_symbol(broker, symbol, state):
 
     chosen["symbol"] = symbol
     chosen["regime"] = regime
+    SYMBOL_RADAR_STATE[symbol] = {
+        "category": "SIGNAL_READY",
+        "side": chosen["side"],
+        "regime": regime,
+        "stage": f"SIGNAL:{chosen['zone']['kind']}",
+        "detail": f"{symbol} [{chosen['side']}] | READY ({chosen['zone']['kind']} Score {chosen['score']:.1f})",
+    }
     return chosen
 
 def dynamic_risk_budget(account, score=6.0):
@@ -3730,6 +3831,111 @@ def wick_rejection_ok(bar, side, max_wick_ratio):
 
 
 
+def emit_smart_market_pulse_radar(active_symbols_list, open_positions, news_blocked):
+    global LAST_RADAR_SIGNATURE, LAST_RADAR_SENT_TS
+
+    if not getattr(CFG, "ENABLE_MARKET_PULSE_RADAR", True):
+        return
+
+    now_ts = time.time()
+    min_interval = float(getattr(CFG, "MARKET_PULSE_MIN_INTERVAL_SEC", 60.0))
+    if now_ts - LAST_RADAR_SENT_TS < min_interval:
+        return
+
+    open_sym_Set = {p.get("symbol") for p in open_positions}
+    news_set = set(news_blocked)
+
+    sig_parts = []
+    ready_list = []
+    strong_list = []
+    normal_list = []
+    conflict_count = 0
+    neutral_count = 0
+    sideway_count = 0
+
+    for sym in active_symbols_list:
+        if sym in open_sym_Set:
+            sig_parts.append(f"{sym}:OPEN_POS")
+            continue
+        if sym in news_set:
+            sig_parts.append(f"{sym}:NEWS_BLACKOUT")
+            continue
+
+        info = SYMBOL_RADAR_STATE.get(sym)
+        if not info:
+            continue
+
+        cat = info.get("category", "BLOCKED")
+        side = info.get("side", "NEUTRAL")
+        stage = info.get("stage", "")
+        detail = info.get("detail", "")
+
+        sig_parts.append(f"{sym}:{cat}:{side}:{stage}")
+
+        if cat == "SIGNAL_READY":
+            ready_list.append(detail)
+        elif cat == "STRONG":
+            strong_list.append(detail)
+        elif cat == "NORMAL":
+            normal_list.append(detail)
+        else:
+            if stage == "M15_EMA200_CONFLICT":
+                conflict_count += 1
+            elif stage == "RANGING_SIDEWAY":
+                sideway_count += 1
+            else:
+                neutral_count += 1
+
+    if not sig_parts:
+        return
+
+    signature = "|".join(sig_parts)
+    if signature == LAST_RADAR_SIGNATURE:
+        return
+
+    LAST_RADAR_SIGNATURE = signature
+    LAST_RADAR_SENT_TS = now_ts
+
+    lines = [f"[MARKET PULSE RADAR] Active: {len(active_symbols_list)} symbols"]
+
+    if open_sym_Set:
+        lines.append(f"Open Positions ({len(open_sym_Set)}): " + ", ".join(sorted(open_sym_Set)))
+
+    if ready_list:
+        lines.append("SIGNAL READY:")
+        for item in ready_list[:6]:
+            lines.append(f" - {item}")
+
+    if strong_list:
+        lines.append(f"1. STRONG TREND ({len(strong_list)}):")
+        for item in strong_list[:8]:
+            lines.append(f" - {item}")
+        if len(strong_list) > 8:
+            lines.append(f" - ...and {len(strong_list) - 8} more")
+
+    if normal_list:
+        lines.append(f"2. NORMAL TREND - SMC WATCH ({len(normal_list)}):")
+        for item in normal_list[:8]:
+            lines.append(f" - {item}")
+        if len(normal_list) > 8:
+            lines.append(f" - ...and {len(normal_list) - 8} more")
+
+    blocked_total = conflict_count + sideway_count + neutral_count + len(news_set)
+    if blocked_total > 0:
+        b_parts = []
+        if conflict_count:
+            b_parts.append(f"H4/M15 conflict: {conflict_count}")
+        if sideway_count:
+            b_parts.append(f"Sideways: {sideway_count}")
+        if neutral_count:
+            b_parts.append(f"H4 neutral: {neutral_count}")
+        if news_set:
+            b_parts.append(f"News blackout: {len(news_set)}")
+        lines.append(f"3. STAND ASIDE / FILTERED ({blocked_total}): " + ", ".join(b_parts))
+
+    notify("\n".join(lines))
+
+
 def main():
     validate_config()
     broker = None
@@ -3877,6 +4083,12 @@ def main():
                             + ("..." if len(news_blocked_symbols) > 8 else ""),
                             900,
                         )
+
+                    emit_smart_market_pulse_radar(
+                        broker.active_symbols,
+                        positions,
+                        news_blocked_symbols,
+                    )
 
                 if all_candidates:
                     all_candidates.sort(key=lambda x: x["score"], reverse=True)

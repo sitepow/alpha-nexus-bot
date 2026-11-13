@@ -9,6 +9,7 @@ import requests
 import bot_config as CFG
 
 log = logging.getLogger("NewsFetcher")
+log.setLevel(logging.WARNING)
 
 INVERSE_ECONOMIC_KEYWORDS = (
     "unemployment",
@@ -284,6 +285,8 @@ class NewsFetcher:
         if self._next_allowed_ts <= time.time():
             backoff_time = CFG.NEWS_DEFAULT_BACKOFF_SEC * (2 ** (self._consecutive_failures - 1))
             self._next_allowed_ts = time.time() + min(CFG.NEWS_MAX_BACKOFF_SEC, backoff_time)
+        if self._consecutive_failures >= 3:
+            log.error("News calendar fetch failed (%d consecutive): %s", self._consecutive_failures, reason)
 
     @staticmethod
     def map_symbol_currencies(symbol: str):
