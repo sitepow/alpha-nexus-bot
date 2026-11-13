@@ -250,19 +250,6 @@ def analyze_order_flow(broker, symbol, side, reference_bar, bars=None):
     buy = (side == "BUY")
 
     try:
-        book = broker.market_book(symbol) if hasattr(broker, "market_book") else broker.read(f"mt5.market_book_get({symbol!r})")
-        if book and isinstance(book, list) and len(book) > 0:
-            ask_volume_total = sum(float(item.get("volume", 0)) for item in book if item.get("type") == 1)
-            bid_volume_total = sum(float(item.get("volume", 0)) for item in book if item.get("type") == 2)
-
-            if buy and bid_volume_total > ask_volume_total * 1.3:
-                flow_score += 1.5
-            elif not buy and ask_volume_total > bid_volume_total * 1.3:
-                flow_score += 1.5
-    except Exception:
-        pass
-
-    try:
         if bars is not None and len(bars) >= 2:
             bar_volume = float(reference_bar.get("volume", 0))
             vol_ma_list = volume_ma(bars, CFG.VOLUME_MA_PERIOD)
@@ -270,12 +257,38 @@ def analyze_order_flow(broker, symbol, side, reference_bar, bars=None):
                 avg_vol = vol_ma_list[-1]
                 if avg_vol > 0 and bar_volume >= avg_vol * CFG.TICK_VOLUME_SURGE_MULTIPLIER:
                     flow_score += 1.5
+                elif avg_vol > 0 and bar_volume >= avg_vol * 1.35:
+                    flow_score += 0.75
+
+            rng = float(reference_bar["high"]) - float(reference_bar["low"])
+            if rng > 0:
+                close_pos = (
+                    (float(reference_bar["close"]) - float(reference_bar["low"])) / rng
+                    if buy
+                    else (float(reference_bar["high"]) - float(reference_bar["close"])) / rng
+                )
+                if close_pos >= 0.75:
+                    flow_score += 0.75
+    except Exception:
+        pass
+
+    try:
+        book = broker.market_book(symbol) if hasattr(broker, "market_book") else broker.read(f"mt5.market_book_get({symbol!r})")
+        if book and isinstance(book, list) and len(book) >= 4:
+            vols = [float(item.get("volume", 0)) for item in book if float(item.get("volume", 0)) > 0]
+            if len(set(vols)) > 1:
+                ask_volume_total = sum(float(item.get("volume", 0)) for item in book if item.get("type") == 1)
+                bid_volume_total = sum(float(item.get("volume", 0)) for item in book if item.get("type") == 2)
+                if buy and bid_volume_total > ask_volume_total * 1.35:
+                    flow_score += 0.5
+                elif not buy and ask_volume_total > bid_volume_total * 1.35:
+                    flow_score += 0.5
     except Exception:
         pass
 
     return min(flow_score, CFG.ORDER_FLOW_SCORE_BOOST)
 
-def scan_momentum_breakout_candidate(broker, symbol, m5_bars, side, volatility):
+def scan_momentum_breakout_candidate(broker, symbol, m5_bars, side, volatility, m15_bars=None):
     if len(m5_bars) < max(210, CFG.VOLUME_MA_PERIOD):
         return None
 
@@ -289,6 +302,18 @@ def scan_momentum_breakout_candidate(broker, symbol, m5_bars, side, volatility):
         return None
     if not buy and not (latest["close"] < m5_ema200 and m5_ema50 <= m5_ema200):
         return None
+
+    if m15_bars and len(m15_bars) >= 55:
+        m15_closes = [b["close"] for b in m15_bars]
+        m15_ema50_now = ema(m15_closes, 50)[-1]
+        m15_atr_vals = atr(m15_bars)
+        m15_ref_atr = m15_atr_vals[-1] if m15_atr_vals and m15_atr_vals[-1] > 0 else 0.0
+        max_ext_atr = float(getattr(CFG, "MAX_MOMENTUM_M15_EMA50_ATR", 3.5))
+        if m15_ref_atr > 0:
+            if buy and (latest["close"] - m15_ema50_now) > (max_ext_atr * m15_ref_atr):
+                return None
+            if not buy and (m15_ema50_now - latest["close"]) > (max_ext_atr * m15_ref_atr):
+                return None
 
     bigbeluga = calculate_bigbeluga_momentum(m5_bars, length=50, smooth=50)
 
@@ -398,7 +423,7 @@ def scan_momentum_breakout_candidate(broker, symbol, m5_bars, side, volatility):
     if not has_volume_boost and not has_sweep_boost and order_flow_points <= 0:
         return None
 
-    final_score = min(score, 10.0)
+    final_score = min(score, 12.0)
 
     if buy:
         zone = {"kind": "MOMENTUM_BIGBELUGA", "side": "BUY", "bottom": extreme, "top": latest["close"]}
@@ -560,15 +585,31 @@ def check_trendline_liquidity_sweep(bars, zone_side):
 
 def calculate_pdh_pdl(broker, symbol):
     daily_bars = broker.bars(
-        symbol, broker.constant("TIMEFRAME_D1"), 3
+        symbol, broker.constant("TIMEFRAME_D1"), 6
     )
     if not daily_bars:
         return None, None
-    
-    previous_day = daily_bars[-1]
-    pdh = previous_day["high"]
-    pdl = previous_day["low"]
-    return pdh, pdl
+
+    ranges = [
+        b["high"] - b["low"]
+        for b in daily_bars
+        if (b["high"] - b["low"]) > 0
+        and datetime.fromtimestamp(b["time"], tz=timezone.utc).weekday() != 6
+    ]
+    avg_range = (sum(ranges) / len(ranges)) if ranges else 0.0
+
+    chosen_day = daily_bars[-1]
+    for bar in reversed(daily_bars):
+        wd = datetime.fromtimestamp(bar["time"], tz=timezone.utc).weekday()
+        bar_range = bar["high"] - bar["low"]
+        if wd == 6:
+            continue
+        if avg_range > 0 and bar_range < avg_range * 0.25:
+            continue
+        chosen_day = bar
+        break
+
+    return chosen_day["high"], chosen_day["low"]
 
 
 def is_prime_killzone_utc():
@@ -588,6 +629,13 @@ def is_prime_killzone_utc():
     return False
 
 
+def _risk_asset_group(symbol):
+    base_c, _, _ = SHARED_NEWS_FETCHER.map_symbol_currencies(symbol)
+    if base_c in {"IDX", "XAU", "XAG", "XPT", "XPD"} or base_c in CRYPTO_BASE_CURRENCIES:
+        return "USD_RISK_ASSET"
+    return None
+
+
 def currency_exposure_ok(symbol, side, active_positions):
     max_per_cur = int(getattr(CFG, "MAX_POSITIONS_PER_CURRENCY", 2))
     if max_per_cur <= 0 or not active_positions:
@@ -601,6 +649,7 @@ def currency_exposure_ok(symbol, side, active_positions):
         new_dir[quote_c] = -1 if side == "BUY" else 1
 
     exposure_counts = {}
+    risk_group_counts = {}
     for pos in active_positions:
         p_sym = pos.get("symbol", "")
         p_buy = int(pos.get("type", 0)) == 0
@@ -612,10 +661,59 @@ def currency_exposure_ok(symbol, side, active_positions):
             d = -1 if p_buy else 1
             exposure_counts[(q_c, d)] = exposure_counts.get((q_c, d), 0) + 1
 
+        rg = _risk_asset_group(p_sym)
+        if rg:
+            rg_dir = 1 if p_buy else -1
+            risk_group_counts[(rg, rg_dir)] = risk_group_counts.get((rg, rg_dir), 0) + 1
+
     for cur, d in new_dir.items():
         if exposure_counts.get((cur, d), 0) >= max_per_cur:
             return False
+
+    cand_rg = _risk_asset_group(symbol)
+    max_rg = int(getattr(CFG, "MAX_RISK_GROUP_EXPOSURE", 2))
+    if cand_rg and max_rg > 0:
+        cand_rg_dir = 1 if side == "BUY" else -1
+        if risk_group_counts.get((cand_rg, cand_rg_dir), 0) >= max_rg:
+            return False
+
     return True
+
+
+def portfolio_open_heat_usd(broker, state, active_positions=None):
+    if active_positions is None:
+        try:
+            active_positions = broker.positions()
+        except Exception:
+            return 0.0
+
+    total_open_risk = 0.0
+    for pos in active_positions:
+        if int(pos.get("magic", 0)) != CFG.MAGIC:
+            continue
+        pid = position_identifier(pos)
+        record = state.get("positions", {}).get(pid)
+        sym = pos.get("symbol", "")
+        vol = float(pos.get("volume", 0.0))
+        sl = float(pos.get("sl", 0.0))
+        entry = float(record["entry"]) if record and "entry" in record else float(pos.get("price_open", 0.0))
+        buy = int(pos.get("type", 0)) == 0
+
+        if vol <= 0 or sl <= 0 or entry <= 0:
+            continue
+        if buy and sl >= entry - CFG.EPSILON:
+            continue
+        if not buy and sl <= entry + CFG.EPSILON:
+            continue
+
+        order_type = broker.constant("ORDER_TYPE_BUY" if buy else "ORDER_TYPE_SELL")
+        try:
+            pos_risk = abs(broker.profit(order_type, sym, vol, entry, sl)) + CFG.COMMISSION_PER_LOT * vol
+            total_open_risk += pos_risk
+        except Exception:
+            pass
+
+    return total_open_risk
 
 def status(key, message, interval=300):
     now = time.time()
@@ -901,6 +999,7 @@ def load_state(path, account_key):
             "mode": expected_mode,
             "day": "",
             "day_start_balance": None,
+            "peak_balance": None,
             "daily_loss_latched": False,
             "consecutive_losses": 0,
             "cooldown_until": 0.0,
@@ -945,6 +1044,7 @@ def load_state(path, account_key):
         raise FatalError("Invalid signal state.")
 
     state.setdefault("dry_run_entries", 0)
+    state.setdefault("peak_balance", state.get("day_start_balance"))
 
     for record in state["positions"].values():
         record.setdefault("last_sl", record["initial_sl"])
@@ -1520,7 +1620,7 @@ def calculate_scoring_logic(broker, bars, zone, sweep_bar, confirmation_bar, ref
     score += order_flow_points
 
     score += 1.5
-    return min(score, 10.0)
+    return min(score, 12.0)
 
 def create_zones(symbol, bars, side):
     volatility = atr(bars)
@@ -1570,7 +1670,7 @@ def create_zones(symbol, bars, side):
 
         fvg_bottom = right["high"] if not buy else left["high"]
         fvg_top = left["low"] if not buy else right["low"]
-        fvg_size = (fvg_top - fvg_bottom) if buy else (fvg_top - fvg_bottom)
+        fvg_size = fvg_top - fvg_bottom
         has_fvg = fvg_size >= (CFG.MIN_FVG_ATR * reference_atr)
 
         local_ob_index = None
@@ -2135,7 +2235,7 @@ def scan_symbol(broker, symbol, state):
                     break
 
     if regime == "STRONG_TREND" or (regime == "RETRACEMENT_SMC" and news_catalyst >= 1.5):
-        mom = scan_momentum_breakout_candidate(broker, symbol, m5, side, volatility)
+        mom = scan_momentum_breakout_candidate(broker, symbol, m5, side, volatility, m15_bars=m15)
         if mom is not None and mom["side"] == side:
             candidates.append(("momentum", mom))
 
@@ -2191,11 +2291,11 @@ def scan_symbol(broker, symbol, state):
         m15_bonus = m15_confirmation(candidate, m15)
         score_boost = m15_bonus
 
-        if kind != "smc" and pdh is not None and pdl is not None:
-            if candidate["side"] == "SELL" and current_price >= pdh - (volatility[-1] * 1.5):
-                score_boost += 2.0
-            elif candidate["side"] == "BUY" and current_price <= pdl + (volatility[-1] * 1.5):
-                score_boost += 2.0
+        if kind == "momentum" and pdh is not None and pdl is not None:
+            if candidate["side"] == "BUY" and current_price >= pdh - (volatility[-1] * 0.5):
+                score_boost += 1.5
+            elif candidate["side"] == "SELL" and current_price <= pdl + (volatility[-1] * 0.5):
+                score_boost += 1.5
 
         if kind == "smc":
             try:
@@ -2239,8 +2339,22 @@ def scan_symbol(broker, symbol, state):
     else:
         chosen = best_smc if best_smc is not None else best_mom
 
+    h4_highs, h4_lows = swings(h4, CFG.HTF_SWING_WINDOW)
+    structural_Resistance = []
+    structural_support = []
+    if pdh is not None:
+        structural_Resistance.append(float(pdh))
+    if pdl is not None:
+        structural_support.append(float(pdl))
+    for h_item in h4_highs[-4:]:
+        structural_Resistance.append(float(h_item["price"]))
+    for l_item in h4_lows[-4:]:
+        structural_support.append(float(l_item["price"]))
+
     chosen["symbol"] = symbol
     chosen["regime"] = regime
+    chosen["structural_highs"] = structural_Resistance
+    chosen["structural_lows"] = structural_support
     SYMBOL_RADAR_STATE[symbol] = {
         "category": "SIGNAL_READY",
         "side": chosen["side"],
@@ -2250,7 +2364,7 @@ def scan_symbol(broker, symbol, state):
     }
     return chosen
 
-def dynamic_risk_budget(account, score=6.0):
+def dynamic_risk_budget(account, score=6.0, peak_balance=None):
     balance = float(account.get("balance", 0.0))
     equity = float(account.get("equity", balance))
     effective_capital = min(balance, equity) if (balance > 0 and equity > 0) else max(balance, equity)
@@ -2258,18 +2372,23 @@ def dynamic_risk_budget(account, score=6.0):
     if not getattr(CFG, "USE_DYNAMIC_RISK", True) or effective_capital <= 0:
         return float(CFG.RISK_PER_TRADE)
 
-    base_pct = float(getattr(CFG, "RISK_PCT", 3.0))
+    base_pct = float(getattr(CFG, "RISK_PCT", 1.25))
     if effective_capital >= 10000.0:
-        tier_pct = min(base_pct, 1.5)
+        tier_pct = min(base_pct, 1.0)
     elif effective_capital >= 3000.0:
-        tier_pct = min(base_pct, 2.0)
-    elif effective_capital >= 1000.0:
-        tier_pct = min(base_pct, 2.5)
+        tier_pct = min(base_pct, 1.15)
     else:
         tier_pct = base_pct
 
+    dd_mult = 1.0
+    if peak_balance is not None and float(peak_balance) > effective_capital:
+        peak_val = float(peak_balance)
+        dd_ratio = (peak_val - effective_capital) / peak_val
+        slope = float(getattr(CFG, "DRAWDOWN_THROTTLE_SLOPE", 5.0))
+        dd_mult = max(0.50, 1.0 - (dd_ratio * slope))
+
     conviction_mult = 1.0 if score >= 9.5 else (0.92 if score >= 7.5 else 0.85)
-    raw_budget = effective_capital * (tier_pct / 100.0) * conviction_mult
+    raw_budget = effective_capital * (tier_pct / 100.0) * conviction_mult * dd_mult
     return max(0.50, raw_budget)
 
 
@@ -2397,7 +2516,7 @@ def stop_gap(info, include_freeze=False):
     return points * float(info["point"]) + tick_size
 
 
-def build_order(broker, candidate, account):
+def build_order(broker, candidate, account, state=None, active_positions=None):
     symbol = candidate["symbol"]
     buy = candidate["side"] == "BUY"
     tag = f"{symbol} {candidate['side']} [{candidate['zone']['kind']}]"
@@ -2432,20 +2551,32 @@ def build_order(broker, candidate, account):
     if int(info["trade_mode"]) not in allowed_modes:
         return reject(f"Broker trade mode blocked (mode={info['trade_mode']})")
 
-    base_spread_limit = (
-        broker.spread_limit_for(symbol)
-        if hasattr(broker, "spread_limit_for")
-        else float(CFG.MAX_SPREAD_BY_SYMBOL.get(symbol, CFG.MAX_SPREAD_POINTS))
-    )
-    spread_limit = base_spread_limit * (1.20 if is_prime_killzone_utc() else 1.0)
-    current_spread = spread_points(tick, info)
-    if current_spread > spread_limit:
-        return reject(f"Spread too high ({current_spread:.1f} pts > {spread_limit:.1f} pts)", permanent=False)
-
     entry = float(tick["ask"] if buy else tick["bid"])
+    spread_price = float(tick["ask"]) - float(tick["bid"])
     volatility = float(candidate["atr"])
     if volatility <= 0:
         return reject("ATR is <= 0")
+
+    floor_atr = max(volatility, float(candidate.get("sl_floor_atr", volatility)))
+    kz_mult = 1.20 if is_prime_killzone_utc() else 1.0
+
+    if getattr(CFG, "USE_ATR_NORMALIZED_SPREAD", True):
+        max_atr_ratio = float(getattr(CFG, "MAX_SPREAD_ATR_RATIO", 0.18)) * kz_mult
+        if spread_price > floor_atr * max_atr_ratio:
+            return reject(
+                f"Spread/ATR too high ({spread_price / floor_atr * 100:.1f}% > {max_atr_ratio * 100:.1f}% of M5 ATR)",
+                permanent=False,
+            )
+    else:
+        base_spread_limit = (
+            broker.spread_limit_for(symbol)
+            if hasattr(broker, "spread_limit_for")
+            else float(CFG.MAX_SPREAD_BY_SYMBOL.get(symbol, CFG.MAX_SPREAD_POINTS))
+        )
+        spread_limit = base_spread_limit * kz_mult
+        current_spread = spread_points(tick, info)
+        if current_spread > spread_limit:
+            return reject(f"Spread too high ({current_spread:.1f} pts > {spread_limit:.1f} pts)", permanent=False)
 
     drift = abs(entry - candidate["signal_close"])
     max_drift = CFG.MAX_ENTRY_DRIFT_ATR * volatility
@@ -2453,7 +2584,6 @@ def build_order(broker, candidate, account):
         return reject(f"Entry drift too high ({drift:.5f} > Max: {max_drift:.5f})", permanent=False)
 
     zone = candidate["zone"]
-    floor_atr = max(volatility, float(candidate.get("sl_floor_atr", volatility)))
     buffer = CFG.SL_BUFFER_ATR * volatility
     gap = stop_gap(info)
     if zone.get("kind") != "MOMENTUM_BIGBELUGA":
@@ -2470,7 +2600,6 @@ def build_order(broker, candidate, account):
         risk_distance = entry - stop
         order_type = broker.constant("ORDER_TYPE_BUY")
     else:
-        spread_price = float(tick["ask"]) - float(tick["bid"])
         raw_sl = max(zone["top"], candidate["extreme"]) + buffer + spread_price
         if min_smc_sl_dist > 0:
             raw_sl = max(raw_sl, entry + min_smc_sl_dist + spread_price)
@@ -2484,6 +2613,14 @@ def build_order(broker, candidate, account):
     if risk_distance > CFG.MAX_SL_ATR * volatility:
         return reject(f"Stop distance too wide ({risk_distance:.5f} > Max: {CFG.MAX_SL_ATR * volatility:.5f})")
 
+    if getattr(CFG, "USE_ATR_NORMALIZED_SPREAD", True):
+        max_sl_ratio = float(getattr(CFG, "MAX_SPREAD_SL_RATIO", 0.12)) * kz_mult
+        if spread_price > risk_distance * max_sl_ratio:
+            return reject(
+                f"Spread/SL ratio too high ({spread_price / risk_distance * 100:.1f}% > {max_sl_ratio * 100:.1f}% of SL)",
+                permanent=False,
+            )
+
     effective_tp2_rr = dynamic_tp_rr(candidate)
     if buy:
         tp_from_rr = entry + effective_tp2_rr * risk_distance
@@ -2491,10 +2628,29 @@ def build_order(broker, candidate, account):
     else:
         tp_from_rr = entry - effective_tp2_rr * risk_distance
         target = price_round(min(tp_from_rr, float(tick["ask"]) - gap), info)
-    
+
+    min_rr = max(CFG.TP1_RR + 0.35, 1.85)
+    if getattr(CFG, "USE_STRUCTURAL_TP", True):
+        pad = 0.10 * volatility
+        if buy:
+            min_struct_tp = entry + min_rr * risk_distance
+            walls = [
+                h - pad for h in candidate.get("structural_highs", [])
+                if (h - pad) >= min_struct_tp and (h - pad) < target
+            ]
+            if walls:
+                target = price_round(min(walls), info, upward=True)
+        else:
+            min_struct_tp = entry - min_rr * risk_distance
+            walls = [
+                l + pad for l in candidate.get("structural_lows", [])
+                if (l + pad) <= min_struct_tp and (l + pad) > target
+            ]
+            if walls:
+                target = price_round(max(walls), info, upward=False)
+
     if "bigbeluga_target" in candidate and candidate["bigbeluga_target"] > 0:
         bb_target = candidate["bigbeluga_target"]
-        min_rr = max(CFG.TP1_RR + 0.5, 2.0)
         if buy:
             min_profitable_tp = entry + min_rr * risk_distance
             if bb_target >= min_profitable_tp and bb_target < target:
@@ -2525,10 +2681,26 @@ def build_order(broker, candidate, account):
     if reference_loss <= 0:
         return reject("Broker profit calculation returned <= 0")
 
-    risk_budget = dynamic_risk_budget(account, score=float(candidate.get("score", 8.0)))
+    peak_bal = state.get("peak_balance") if isinstance(state, dict) else None
+    risk_budget = dynamic_risk_budget(account, score=float(candidate.get("score", 8.0)), peak_balance=peak_bal)
     balance = float(account.get("balance", 0.0))
-    max_fallback_pct = float(getattr(CFG, "MIN_LOT_FALLBACK_MAX_RISK_PCT", 6.0))
-    max_fallback_budget = max(risk_budget, balance * (max_fallback_pct / 100.0)) if balance > 0 else risk_budget
+    equity = float(account.get("equity", balance))
+    effective_cap = min(balance, equity) if (balance > 0 and equity > 0) else max(balance, equity)
+
+    if isinstance(state, dict) and effective_cap > 0:
+        max_heat_pct = float(getattr(CFG, "MAX_OPEN_PORTFOLIO_HEAT_PCT", 3.0))
+        max_heat_usd = effective_cap * (max_heat_pct / 100.0)
+        current_heat_usd = portfolio_open_heat_usd(broker, state, active_positions=active_positions)
+        remaining_heat_usd = max_heat_usd - current_heat_usd
+        if remaining_heat_usd <= 0.50:
+            return reject(
+                f"Portfolio open risk heat cap reached (${current_heat_usd:.2f} / ${max_heat_usd:.2f})",
+                permanent=False,
+            )
+        risk_budget = min(risk_budget, remaining_heat_usd)
+
+    max_fallback_pct = float(getattr(CFG, "MIN_LOT_FALLBACK_MAX_RISK_PCT", 2.5))
+    max_fallback_budget = max(risk_budget, effective_cap * (max_fallback_pct / 100.0)) if effective_cap > 0 else risk_budget
 
     estimated_per_lot = reference_loss / minimum
     volume = floor_volume(min(risk_budget / estimated_per_lot, maximum), step)
@@ -3291,6 +3463,12 @@ def daily_snapshot(broker, state, path):
     today = utc_now().date().isoformat()
     total_cash = sum(deal_cash(deal) for deal in deals)
 
+    cur_bal = float(account.get("balance", 0.0))
+    prev_peak = float(state.get("peak_balance") or 0.0)
+    if cur_bal > prev_peak:
+        state["peak_balance"] = cur_bal
+        atomic_save(path, state)
+
     if state["day"] != today:
         prev_day = state.get("day", "")
         prev_start_balance = state.get("day_start_balance")
@@ -3683,15 +3861,16 @@ def manage_positions(broker, state, path):
             )
 
         be_trigger_r = float(getattr(CFG, "BREAKEVEN_TRIGGER_RR", 1.0))
+        stage1_lock_r = float(getattr(CFG, "STAGE1_REDUCE_RISK_RR", -0.35))
         be_lock_r = float(getattr(CFG, "BREAKEVEN_LOCK_RR", 0.10))
         if not record["partial_done"]:
             if current_r >= be_trigger_r:
-                be_sl = (
-                    entry + (be_lock_r * initial_risk)
+                stage1_sl = (
+                    entry + (stage1_lock_r * initial_risk)
                     if buy
-                    else entry - (be_lock_r * initial_risk)
+                    else entry - (stage1_lock_r * initial_risk)
                 )
-                be_req = stop_request(broker, pid, be_sl)
+                be_req = stop_request(broker, pid, stage1_sl)
                 if be_req is not None:
                     execute_request(
                         broker,
@@ -4145,6 +4324,8 @@ def main():
                             broker,
                             candidate,
                             fresh_snapshot["account"],
+                            state=state,
+                            active_positions=fresh_positions,
                         )
 
                         if built is None:
