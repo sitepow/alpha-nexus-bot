@@ -99,10 +99,7 @@ def is_monday_opening_gap_window(symbol):
         return minutes_since_reopen < cooldown_mins
     if now.weekday() == 0:
         minutes_since_sunday_reopen = 120 + now.hour * 60 + now.minute
-        if minutes_since_sunday_reopen < cooldown_mins:
-            return True
-        if now.hour == 0 and now.minute < min(cooldown_mins, 15):
-            return True
+        return minutes_since_sunday_reopen < cooldown_mins
     return False
 
 
@@ -242,7 +239,7 @@ def utc_midnight_timestamp():
         hour=0, minute=0, second=0, microsecond=0
     ).timestamp()
 
-def analyze_order_flow(broker, symbol, side, reference_bar, bars=None):
+def analyze_order_flow(broker, symbol, side, reference_bar, bars=None, include_volume_surge=True):
     if not getattr(CFG, "ENABLE_ORDER_FLOW_SCORING", True):
         return 0.0
 
@@ -251,14 +248,15 @@ def analyze_order_flow(broker, symbol, side, reference_bar, bars=None):
 
     try:
         if bars is not None and len(bars) >= 2:
-            bar_volume = float(reference_bar.get("volume", 0))
-            vol_ma_list = volume_ma(bars, CFG.VOLUME_MA_PERIOD)
-            if vol_ma_list:
-                avg_vol = vol_ma_list[-1]
-                if avg_vol > 0 and bar_volume >= avg_vol * CFG.TICK_VOLUME_SURGE_MULTIPLIER:
-                    flow_score += 1.5
-                elif avg_vol > 0 and bar_volume >= avg_vol * 1.35:
-                    flow_score += 0.75
+            if include_volume_surge:
+                bar_volume = float(reference_bar.get("volume", 0))
+                vol_ma_list = volume_ma(bars, CFG.VOLUME_MA_PERIOD)
+                if vol_ma_list:
+                    avg_vol = vol_ma_list[-1]
+                    if avg_vol > 0 and bar_volume >= avg_vol * CFG.TICK_VOLUME_SURGE_MULTIPLIER:
+                        flow_score += 1.5
+                    elif avg_vol > 0 and bar_volume >= avg_vol * 1.35:
+                        flow_score += 0.75
 
             rng = float(reference_bar["high"]) - float(reference_bar["low"])
             if rng > 0:
@@ -277,8 +275,8 @@ def analyze_order_flow(broker, symbol, side, reference_bar, bars=None):
         if book and isinstance(book, list) and len(book) >= 4:
             vols = [float(item.get("volume", 0)) for item in book if float(item.get("volume", 0)) > 0]
             if len(set(vols)) > 1:
-                ask_volume_total = sum(float(item.get("volume", 0)) for item in book if item.get("type") == 1)
-                bid_volume_total = sum(float(item.get("volume", 0)) for item in book if item.get("type") == 2)
+                ask_volume_total = sum(float(item.get("volume", 0)) for item in book if int(item.get("type", 0)) in {1, 4})
+                bid_volume_total = sum(float(item.get("volume", 0)) for item in book if int(item.get("type", 0)) in {2, 3})
                 if buy and bid_volume_total > ask_volume_total * 1.35:
                     flow_score += 0.5
                 elif not buy and ask_volume_total > bid_volume_total * 1.35:
@@ -417,7 +415,7 @@ def scan_momentum_breakout_candidate(broker, symbol, m5_bars, side, volatility, 
     except Exception:
         pass
 
-    order_flow_points = analyze_order_flow(broker, symbol, side, latest, m5_bars[:-1])
+    order_flow_points = analyze_order_flow(broker, symbol, side, latest, m5_bars[:-1], include_volume_surge=False)
     score += order_flow_points
 
     if not has_volume_boost and not has_sweep_boost and order_flow_points <= 0:
@@ -590,19 +588,24 @@ def calculate_pdh_pdl(broker, symbol):
     if not daily_bars:
         return None, None
 
+    srv_offset = int(round(getattr(broker, "_server_offset_sec", 0.0)))
+
+    def _bar_server_weekday(bar_item):
+        return datetime.fromtimestamp(int(bar_item["time"]) + srv_offset, tz=timezone.utc).weekday()
+
     ranges = [
         b["high"] - b["low"]
         for b in daily_bars
         if (b["high"] - b["low"]) > 0
-        and datetime.fromtimestamp(b["time"], tz=timezone.utc).weekday() != 6
+        and _bar_server_weekday(b) not in {5, 6}
     ]
     avg_range = (sum(ranges) / len(ranges)) if ranges else 0.0
 
     chosen_day = daily_bars[-1]
     for bar in reversed(daily_bars):
-        wd = datetime.fromtimestamp(bar["time"], tz=timezone.utc).weekday()
+        wd = _bar_server_weekday(bar)
         bar_range = bar["high"] - bar["low"]
-        if wd == 6:
+        if wd == 6 or (wd == 5 and not is_crypto_symbol(symbol)):
             continue
         if avg_range > 0 and bar_range < avg_range * 0.25:
             continue
@@ -697,7 +700,7 @@ def portfolio_open_heat_usd(broker, state, active_positions=None):
         vol = float(pos.get("volume", 0.0))
         sl = float(pos.get("sl", 0.0))
         entry = float(record["entry"]) if record and "entry" in record else float(pos.get("price_open", 0.0))
-        buy = int(pos.get("type", 0)) == 0
+        buy = int(pos.get("type", 0)) == broker.constant("POSITION_TYPE_BUY")
 
         if vol <= 0 or sl <= 0 or entry <= 0:
             continue
@@ -708,7 +711,13 @@ def portfolio_open_heat_usd(broker, state, active_positions=None):
 
         order_type = broker.constant("ORDER_TYPE_BUY" if buy else "ORDER_TYPE_SELL")
         try:
-            pos_risk = abs(broker.profit(order_type, sym, vol, entry, sl)) + CFG.COMMISSION_PER_LOT * vol
+            info = broker.info(sym)
+            allowance = CFG.RISK_SLIPPAGE_POINTS * float(info["point"])
+            worse_entry = entry + allowance if buy else entry - allowance
+            worse_sl = sl - allowance if buy else sl + allowance
+            if min(worse_entry, worse_sl) <= 0:
+                worse_entry, worse_sl = entry, sl
+            pos_risk = abs(broker.profit(order_type, sym, vol, worse_entry, worse_sl)) + CFG.COMMISSION_PER_LOT * vol
             total_open_risk += pos_risk
         except Exception:
             pass
@@ -1111,11 +1120,31 @@ class Broker:
     def info(self, symbol):
         return self.named(f"mt5.symbol_info({symbol!r})")
 
-    def update_server_offset(self, raw_server_ts):
+    def update_server_offset(self, raw_server_ts, max_Select_drift_sec=90.0):
+        if raw_server_ts is None or float(raw_server_ts) <= 0:
+            return self._server_offset_sec
         diff = float(raw_server_ts) - time.time()
         nearest_half_hour = round(diff / 1800.0) * 1800.0
-        if abs(nearest_half_hour) <= 14 * 3600 and abs(diff - nearest_half_hour) <= 300:
+        if abs(nearest_half_hour) <= 14 * 3600 and abs(diff - nearest_half_hour) <= max_Select_drift_sec:
             self._server_offset_sec = float(nearest_half_hour)
+        return self._server_offset_sec
+
+    def calibrate_server_offset(self):
+        offsets = []
+        probe_list = (self.active_symbols or CFG.SYMBOLS)[:8]
+        for sym in probe_list:
+            try:
+                raw_tick = self.named(f"mt5.symbol_info_tick({sym!r})")
+                ts = tick_timestamp(raw_tick)
+                diff = float(ts) - time.time()
+                nh = round(diff / 1800.0) * 1800.0
+                if abs(nh) <= 14 * 3600 and abs(diff - nh) <= 90.0:
+                    offsets.append(float(nh))
+            except Exception:
+                continue
+        if offsets:
+            offsets.sort()
+            self._server_offset_sec = offsets[len(offsets) // 2]
         return self._server_offset_sec
 
     def to_utc_ts(self, server_ts):
@@ -1196,11 +1225,7 @@ class Broker:
         previous = None
 
         if values and getattr(self, "_server_offset_sec", 0.0) == 0.0:
-            try:
-                raw_tick = self.named(f"mt5.symbol_info_tick({symbol!r})")
-                self.update_server_offset(tick_timestamp(raw_tick))
-            except Exception:
-                pass
+            self.calibrate_server_offset()
 
         offset_int = int(round(getattr(self, "_server_offset_sec", 0.0)))
         for bar in values:
@@ -1873,7 +1898,7 @@ def zone_signal(zone, bars, volatility, pdh=None, pdl=None, broker=None):
 
         sweep_modifier = base_score_modifier
 
-        if not wick_rejection_ok(sweep_bar, zone["side"], CFG.MAX_SWEEP_WICK_RATIO):
+        if not sweep_wick_ok(sweep_bar, zone["side"]):
             sweep_modifier -= 1.0
 
         if buy:
@@ -2109,7 +2134,7 @@ def news_permission(broker, symbol):
     if not CFG.ENABLE_NEWS_FILTER:
         return True, "News filter disabled."
 
-    if SHARED_NEWS_FETCHER.is_restricted_time(symbol, buffer_minutes=CFG.NEWS_BEFORE_MINUTES):
+    if SHARED_NEWS_FETCHER.is_restricted_time(symbol):
         return False, "A high/medium-impact news blackout window is active."
 
     return True, "News checks passed."
@@ -2610,8 +2635,8 @@ def build_order(broker, candidate, account, state=None, active_positions=None):
 
     if stop <= 0 or risk_distance <= 0:
         return reject(f"Invalid stop geometry (Stop: {stop}, Dist: {risk_distance:.5f})")
-    if risk_distance > CFG.MAX_SL_ATR * volatility:
-        return reject(f"Stop distance too wide ({risk_distance:.5f} > Max: {CFG.MAX_SL_ATR * volatility:.5f})")
+    if risk_distance > CFG.MAX_SL_ATR * floor_atr:
+        return reject(f"Stop distance too wide ({risk_distance:.5f} > Max: {CFG.MAX_SL_ATR * floor_atr:.5f})")
 
     if getattr(CFG, "USE_ATR_NORMALIZED_SPREAD", True):
         max_sl_ratio = float(getattr(CFG, "MAX_SPREAD_SL_RATIO", 0.12)) * kz_mult
@@ -2998,6 +3023,10 @@ def resolve_pending(broker, state, path):
                     entry - stop if side == "BUY" else stop - entry
                 )
 
+                zone_id_meta = pending["metadata"].get("zone_id")
+                if zone_id_meta:
+                    state["seen_zones"][zone_id_meta] = time.time()
+
                 state["positions"][pid] = {
                     "symbol": request["symbol"],
                     "side": side,
@@ -3011,7 +3040,7 @@ def resolve_pending(broker, state, path):
                     "opened_at": min(
                         broker.to_utc_ts(float(deal["time"])) for deal in entries
                     ),
-                    "zone_id": pending["metadata"]["zone_id"],
+                    "zone_id": zone_id_meta,
                 }
 
                 state["pending"] = None
@@ -3043,9 +3072,22 @@ def resolve_pending(broker, state, path):
                     )
                 ) + CFG.COMMISSION_PER_LOT * volume
 
+                try:
+                    acct_now = broker.account()
+                    bal_now = float(acct_now.get("balance", 0.0))
+                except Exception:
+                    bal_now = 0.0
+                max_pct_Allowance = max(
+                    float(getattr(CFG, "RISK_PCT", 1.25)),
+                    float(getattr(CFG, "MIN_LOT_FALLBACK_MAX_RISK_PCT", 2.5)),
+                    float(getattr(CFG, "MAX_OPEN_PORTFOLIO_HEAT_PCT", 3.0)),
+                )
+                dynamic_acct_ceiling = bal_now * (max_pct_Allowance / 100.0) * 1.50 if bal_now > 0 else 0.0
+                est_loss_meta = float(pending["metadata"].get("estimated_loss", CFG.RISK_PER_TRADE))
                 allowed_risk_ceiling = max(
-                    float(CFG.RISK_PER_TRADE),
-                    float(pending["metadata"].get("estimated_loss", CFG.RISK_PER_TRADE)) * 1.35,
+                    float(CFG.RISK_PER_TRADE) * 1.50,
+                    est_loss_meta * 1.50,
+                    dynamic_acct_ceiling,
                 )
                 if actual_risk > allowed_risk_ceiling + CFG.EPSILON:
                     mark_halt(
@@ -3107,6 +3149,18 @@ def resolve_pending(broker, state, path):
 
     if rejection_is_definite(broker, pending.get("result")):
         code = int(pending["result"]["retcode"])
+        permanent_codes = {
+            broker.constant("TRADE_RETCODE_INVALID"),
+            broker.constant("TRADE_RETCODE_INVALID_VOLUME"),
+            broker.constant("TRADE_RETCODE_INVALID_STOPS"),
+            broker.constant("TRADE_RETCODE_TRADE_DISABLED"),
+            broker.constant("TRADE_RETCODE_NO_MONEY"),
+            broker.constant("TRADE_RETCODE_INVALID_FILL"),
+        }
+        if kind == "ENTRY" and code in permanent_codes:
+            zone_id_meta = pending["metadata"].get("zone_id")
+            if zone_id_meta:
+                state["seen_zones"][zone_id_meta] = time.time()
         state["pending"] = None
         atomic_save(path, state)
         notify(f"Execution rejected. Action: {kind}. Code: {code}")
@@ -3115,7 +3169,7 @@ def resolve_pending(broker, state, path):
     pending_age = time.time() - float(pending.get("created", time.time()))
     stale_timeout = float(getattr(CFG, "PENDING_STALE_RECONCILE_SECONDS", 90.0))
 
-    if pending.get("result") is None and pending_age >= stale_timeout:
+    if pending_age >= stale_timeout:
         if kind in {"PARTIAL", "FULL_CLOSE"}:
             pid = pending["metadata"]["position_id"]
             live_pos = next(
@@ -3543,15 +3597,19 @@ def daily_snapshot(broker, state, path):
     }
 
 
-def in_session(symbols=None):
-    active_list = symbols if symbols is not None else CFG.SYMBOLS
-    has_crypto = any(is_crypto_symbol(s) for s in active_list)
-    if is_friday_weekend_close_window() and not has_crypto:
-        return False
-    if utc_now().weekday() >= 5 and has_crypto:
+def in_session_for_symbol(symbol):
+    if is_crypto_symbol(symbol):
+        if CFG.USE_KILLZONES_ONLY:
+            return is_prime_killzone_utc()
         return True
 
-    hour = utc_now().hour
+    now_utc = utc_now()
+    if now_utc.weekday() == 5 or (now_utc.weekday() == 6 and now_utc.hour < 22):
+        return False
+    if is_friday_weekend_close_window(symbol):
+        return False
+    if is_monday_opening_gap_window(symbol):
+        return False
 
     if CFG.USE_KILLZONES_ONLY:
         return is_prime_killzone_utc()
@@ -3559,7 +3617,6 @@ def in_session(symbols=None):
     if getattr(CFG, "USE_AUTO_DST_KILLZONES", True):
         try:
             from zoneinfo import ZoneInfo
-            now_utc = utc_now()
             london_hour = now_utc.astimezone(ZoneInfo("Europe/London")).hour
             ny_hour = now_utc.astimezone(ZoneInfo("America/New_York")).hour
             if (7 <= london_hour < 17) or (7 <= ny_hour < 17):
@@ -3568,6 +3625,7 @@ def in_session(symbols=None):
         except Exception:
             pass
 
+    hour = now_utc.hour
     if CFG.SESSION_START_HOUR_UTC == CFG.SESSION_END_HOUR_UTC:
         return True
 
@@ -3578,6 +3636,11 @@ def in_session(symbols=None):
         hour >= CFG.SESSION_START_HOUR_UTC
         or hour < CFG.SESSION_END_HOUR_UTC
     )
+
+
+def in_session(symbols=None):
+    active_list = symbols if symbols is not None else CFG.SYMBOLS
+    return any(in_session_for_symbol(s) for s in active_list)
 
 
 def entry_permission(broker, state, snapshot, positions, orders):
@@ -4009,6 +4072,21 @@ def wick_rejection_ok(bar, side, max_wick_ratio):
     return (wick / bar_range) <= max_wick_ratio
 
 
+def sweep_wick_ok(bar, side, min_sweep_wick_ratio=0.15, max_counter_wick_ratio=0.65):
+    bar_range = bar["high"] - bar["low"]
+    if bar_range <= 0:
+        return False
+
+    if side == "BUY":
+        sweep_wick = min(bar["open"], bar["close"]) - bar["low"]
+        counter_wick = bar["high"] - max(bar["open"], bar["close"])
+    else:
+        sweep_wick = bar["high"] - max(bar["open"], bar["close"])
+        counter_wick = min(bar["open"], bar["close"]) - bar["low"]
+
+    return (sweep_wick / bar_range) >= min_sweep_wick_ratio and (counter_wick / bar_range) <= max_counter_wick_ratio
+
+
 
 def emit_smart_market_pulse_radar(active_symbols_list, open_positions, news_blocked):
     global LAST_RADAR_SIGNATURE, LAST_RADAR_SENT_TS
@@ -4134,6 +4212,7 @@ def main():
         acquire_lock(account_key)
         validate_account(broker, account_key)
         broker.select_symbols()
+        broker.calibrate_server_offset()
 
         mode = "dry" if CFG.DRY_RUN else "live"
 
@@ -4147,7 +4226,7 @@ def main():
         notify(
             "SMC bot started.\n"
             f"Mode: {'DRY_RUN' if CFG.DRY_RUN else 'LIVE'}\n"
-            f"Balance: {float(account.get('balance', 0.0)):.2f} {account.get('currency', 'USD')} | Dynamic risk: {getattr(CFG, 'USE_DYNAMIC_RISK', True)} ({getattr(CFG, 'RISK_PCT', 3.0):.1f}%)\n"
+            f"Balance: {float(account.get('balance', 0.0)):.2f} {account.get('currency', 'USD')} | Dynamic risk: {getattr(CFG, 'USE_DYNAMIC_RISK', True)} ({getattr(CFG, 'RISK_PCT', 1.25):.2f}%)\n"
             f"Dynamic daily quota: {getattr(CFG, 'USE_DYNAMIC_DAILY_TRADES', True)} (Base: {CFG.MAX_DAILY_TRADES})\n"
             f"Dynamic TP scaling: {getattr(CFG, 'USE_DYNAMIC_TP_SCALING', True)} | Dynamic time exit: {getattr(CFG, 'USE_DYNAMIC_TIME_EXIT', True)}\n"
             f"Auto-DST London/NY session: {getattr(CFG, 'USE_AUTO_DST_KILLZONES', True)} | News filter: {CFG.ENABLE_NEWS_FILTER}"
@@ -4178,7 +4257,7 @@ def main():
                         notify(msg)
                         last_weekend_notify_date = current_date
                     
-                    time.sleep(3600)
+                    time.sleep(min(60.0, float(CFG.POLL_SECONDS)))
                     continue
                 
                 validate_account(broker, account_key)
@@ -4233,6 +4312,8 @@ def main():
                     logging.debug("Scanning %d active symbol(s)...", len(broker.active_symbols))
                     for symbol in broker.active_symbols:
                         if symbol in active_symbols:
+                            continue
+                        if not in_session_for_symbol(symbol):
                             continue
                         if is_fx_weekend_closed and not is_crypto_symbol(symbol):
                             continue
@@ -4334,18 +4415,17 @@ def main():
                                 atomic_save(state_path, state)
                             continue
 
+                        if not in_session_for_symbol(symbol):
+                            continue
+
                         request, estimated_loss = built
 
-                        state["seen_zones"][zone_id] = time.time()
-
                         if CFG.DRY_RUN:
+                            state["seen_zones"][zone_id] = time.time()
                             state["dry_run_entries"] = (
                                 int(state.get("dry_run_entries", 0)) + 1
                             )
-
-                        atomic_save(state_path, state)
-
-                        if CFG.DRY_RUN:
+                            atomic_save(state_path, state)
                             if CFG.TELEGRAM_TOKEN and CFG.TELEGRAM_CHAT_ID:
                                 try:
                                     requests.post(

@@ -290,9 +290,15 @@ class NewsFetcher:
 
     @staticmethod
     def map_symbol_currencies(symbol: str):
-        clean = re.sub(r"[^A-Z0-9]", "", symbol.upper())
-        base_cur = clean[:3] if len(clean) >= 3 else ""
-        quote_cur = clean[3:6] if len(clean) >= 6 else "USD"
+        raw = str(symbol).strip()
+        for suf in (".pro", ".raw", ".std", ".ecn", ".a", ".b", ".c", ".i", "_i"):
+            if raw.lower().endswith(suf):
+                raw = raw[: -len(suf)]
+                break
+        if len(raw) >= 6 and raw.endswith(("m", "c")) and raw[:-1].isupper():
+            raw = raw[:-1]
+
+        clean = re.sub(r"[^A-Z0-9]", "", raw.upper())
 
         if any(idx in clean for idx in ("US30", "DJ30", "USTEC", "NAS100", "US100", "US500", "SPX500", "US2000", "USOIL", "WTI", "XTI", "XNG")):
             base_cur, quote_cur = "IDX", "USD"
@@ -306,6 +312,26 @@ class NewsFetcher:
             base_cur, quote_cur = "IDX", "AUD"
         elif any(idx in clean for idx in ("HK50", "HSI", "CN50", "CHINA50")):
             base_cur, quote_cur = "IDX", "CNY"
+        elif clean.startswith("GOLD"):
+            base_cur = "XAU"
+            quote_cur = clean[4:7] if len(clean) >= 7 else "USD"
+        elif clean.startswith("SILVER"):
+            base_cur = "XAG"
+            quote_cur = clean[6:9] if len(clean) >= 9 else "USD"
+        else:
+            four_char_prefixes = ("DOGE", "LINK", "AVAX", "SHIB", "PEPE", "NEAR", "ATOM", "AAVE", "ALGO")
+            matched_prefix = next((p for p in four_char_prefixes if clean.startswith(p)), None)
+            if matched_prefix:
+                base_cur = matched_prefix
+                rem = clean[len(matched_prefix):]
+                quote_cur = "USD" if rem.startswith(("USD", "USDT", "USDC")) or not rem else rem[:3]
+            else:
+                base_cur = clean[:3] if len(clean) >= 3 else ""
+                rem = clean[3:]
+                if rem.startswith(("USD", "USDT", "USDC")):
+                    quote_cur = "USD"
+                else:
+                    quote_cur = rem[:3] if len(rem) >= 3 else "USD"
 
         direct = {c for c in (base_cur, quote_cur) if c and c != "IDX"}
         if base_cur in {"IDX", "XAU", "XAG", "XPT", "XPD", "BTC", "XBT", "ETH", "SOL", "XRP", "BNB", "ADA", "DOGE", "LINK", "DOT", "AVAX", "LTC", "BCH"}:
@@ -314,17 +340,17 @@ class NewsFetcher:
 
         return base_cur, quote_cur, direct
 
-    def is_restricted_time(self, symbol: str, buffer_minutes: int = 15) -> bool:
+    def is_restricted_time(self, symbol: str, buffer_minutes: float | None = None) -> bool:
         now = datetime.now(timezone.utc).replace(tzinfo=None)
         _, _, currencies = self.map_symbol_currencies(symbol)
         if not currencies:
             return False
 
-        high_before = float(getattr(CFG, "NEWS_BEFORE_MINUTES", buffer_minutes))
+        high_before = float(buffer_minutes) if buffer_minutes is not None else float(getattr(CFG, "NEWS_BEFORE_MINUTES", 25.0))
         high_after = float(getattr(CFG, "NEWS_AFTER_MINUTES", 10.0))
         super_before = float(getattr(CFG, "NEWS_SUPER_HIGH_BEFORE_MINUTES", 35.0))
         super_after = float(getattr(CFG, "NEWS_SUPER_HIGH_AFTER_MINUTES", 15.0))
-        med_before = float(getattr(CFG, "NEWS_MEDIUM_BEFORE_MINUTES", 10.0))
+        med_before = float(getattr(CFG, "NEWS_MEDIUM_BEFORE_MINUTES", 15.0))
         med_after = float(getattr(CFG, "NEWS_MEDIUM_AFTER_MINUTES", 5.0))
 
         with self._lock:
@@ -335,10 +361,10 @@ class NewsFetcher:
                 is_high = (news["impact"] == "High")
                 is_super = is_high and is_super_high_impact(news.get("title", ""))
                 if is_super:
-                    before_window = max(float(buffer_minutes), high_before, super_before)
+                    before_window = max(high_before, super_before)
                     after_window = max(high_after, super_after)
                 elif is_high:
-                    before_window = max(float(buffer_minutes), high_before)
+                    before_window = high_before
                     after_window = high_after
                 else:
                     before_window = med_before
