@@ -97,7 +97,7 @@ def is_monday_opening_gap_window(symbol, m5_bars=None):
         recent_bars = m5_bars[-12:]
         for idx in range(len(recent_bars) - 1, 0, -1):
             gap_sec = int(recent_bars[idx]["time"]) - int(recent_bars[idx - 1]["time"])
-            if gap_sec >= 7200:
+            if gap_sec >= 21600:
                 reopen_open_ts = float(recent_bars[idx]["time"])
                 mins_since_reopen = (now_ts - reopen_open_ts) / 60.0
                 if 0.0 <= mins_since_reopen < cooldown_mins:
@@ -111,7 +111,17 @@ def is_monday_opening_gap_window(symbol, m5_bars=None):
         base_c in {"XAU", "XAG", "XPT", "XPD", "IDX"}
         or any(k in clean_s for k in ("USOIL", "UKOIL", "WTI", "BRENT", "XTI", "XBR", "XNG"))
     )
-    reopen_hour_utc = 23 if is_late_reopen_asset else 22
+
+    us_dst_active = False
+    try:
+        from zoneinfo import ZoneInfo
+        ny_dt = now.astimezone(ZoneInfo("America/New_York"))
+        us_dst_active = bool(ny_dt.dst())
+    except Exception:
+        pass
+
+    base_fx_reopen_hour = 21 if us_dst_active else 22
+    reopen_hour_utc = (base_fx_reopen_hour + 1) if is_late_reopen_asset else base_fx_reopen_hour
 
     if now.weekday() == 6:
         if now.hour < reopen_hour_utc:
@@ -3954,27 +3964,27 @@ def manage_positions(broker, state, path):
                 )
                 return
 
-        if (
-            CFG.ENABLE_TIME_EXIT
-            and not record.get("partial_done", False)
-            and age_seconds >= effective_exit_min * 60
-            and current_r < CFG.TIME_EXIT_MIN_R
-        ):
-            request = partial_request(broker, position, volume)
+                if (
+                    CFG.ENABLE_TIME_EXIT
+                    and not record.get("partial_done", False)
+                    and age_seconds >= effective_exit_min * 60
+                    and current_r < CFG.TIME_EXIT_MIN_R
+                ):
+                    request = partial_request(broker, position, volume)
 
-            execute_request(
-                broker,
-                state,
-                path,
-                "FULL_CLOSE",
-                request,
-                {
-                    "position_id": pid,
-                    "reason": "TIME_EXIT",
-                    "current_r": current_r,
-                },
-            )
-            return
+                    execute_request(
+                        broker,
+                        state,
+                        path,
+                        "FULL_CLOSE",
+                        request,
+                        {
+                            "position_id": pid,
+                            "reason": "TIME_EXIT",
+                            "current_r": current_r,
+                        },
+                    )
+                    return
 
             target1 = (
                 entry + CFG.TP1_RR * initial_risk
@@ -4111,7 +4121,6 @@ def manage_positions(broker, state, path):
             return
         except SafetyError:
             continue
-
 
 def account_key_from(account):
     raw = (
@@ -4411,6 +4420,11 @@ def main():
 
                 if not permitted:
                     status("entry_gate", reason)
+                    emit_smart_market_pulse_radar(
+                        broker.active_symbols,
+                        positions,
+                        [],
+                    )
                 else:
                     active_symbols = {item["symbol"] for item in positions + orders}
                     news_blocked_symbols = []
@@ -4442,7 +4456,7 @@ def main():
                         candidate = scan_symbol(broker, symbol, state)
 
                         if candidate is not None:
-                            if not currency_exposure_ok(symbol, candidate["side"], positions):
+                            if not currency_exposure_ok(symbol, candidate["side"], positions, buy_type_const=broker.constant("POSITION_TYPE_BUY")):
                                 continue
                             zone_id = candidate["zone_id"]
                             if zone_id not in state["seen_zones"]:
@@ -4504,7 +4518,7 @@ def main():
                         ):
                             continue
 
-                        if not currency_exposure_ok(symbol, candidate["side"], fresh_positions):
+                        if not currency_exposure_ok(symbol, candidate["side"], fresh_positions, buy_type_const=broker.constant("POSITION_TYPE_BUY")):
                             continue
 
                         bot_positions = [

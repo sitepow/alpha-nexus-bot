@@ -4,7 +4,7 @@ Central configuration module for SMC/Price Action Trading Bot & NewsFetcher.
 
 import math
 import os
-import jsonS
+import json
 from pathlib import Path
 from dotenv import load_dotenv
 
