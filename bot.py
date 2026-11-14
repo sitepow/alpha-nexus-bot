@@ -75,12 +75,25 @@ def is_crypto_symbol(symbol):
     return base_c in CRYPTO_BASE_CURRENCIES
 
 
+def base_fx_sunday_reopen_hour_utc(dt_utc=None):
+    ref_dt = dt_utc if dt_utc is not None else datetime.now(timezone.utc)
+    try:
+        from zoneinfo import ZoneInfo
+        ny_dt = ref_dt.astimezone(ZoneInfo("America/New_York"))
+        if bool(ny_dt.dst()):
+            return 21
+    except Exception:
+        pass
+    return 22
+
+
 def is_weekend(symbols=None):
     active_list = symbols if symbols is not None else CFG.SYMBOLS
     current_utc_time = datetime.now(timezone.utc)
     if current_utc_time.weekday() < 5:
         return False
-    if current_utc_time.weekday() == 6 and current_utc_time.hour >= 22:
+    reopen_hour = base_fx_sunday_reopen_hour_utc(current_utc_time)
+    if current_utc_time.weekday() == 6 and current_utc_time.hour >= reopen_hour:
         return False
     return not any(is_crypto_symbol(sym) for sym in active_list)
 
@@ -112,15 +125,7 @@ def is_monday_opening_gap_window(symbol, m5_bars=None):
         or any(k in clean_s for k in ("USOIL", "UKOIL", "WTI", "BRENT", "XTI", "XBR", "XNG"))
     )
 
-    us_dst_active = False
-    try:
-        from zoneinfo import ZoneInfo
-        ny_dt = now.astimezone(ZoneInfo("America/New_York"))
-        us_dst_active = bool(ny_dt.dst())
-    except Exception:
-        pass
-
-    base_fx_reopen_hour = 21 if us_dst_active else 22
+    base_fx_reopen_hour = base_fx_sunday_reopen_hour_utc(now)
     reopen_hour_utc = (base_fx_reopen_hour + 1) if is_late_reopen_asset else base_fx_reopen_hour
 
     if now.weekday() == 6:
@@ -1120,6 +1125,8 @@ class Broker:
         self.active_symbols = list(CFG.SYMBOLS)
         self.base_symbol_map = {s: s for s in CFG.SYMBOLS}
         self._dom_cache = {}
+        self._dom_subscribed = set()
+        self._dom_unsupported = set()
 
     def constant(self, name):
         return int(getattr(self.mt5, name))
@@ -1176,7 +1183,10 @@ class Broker:
         if CFG.MT5_SERVER:
             options["server"] = CFG.MT5_SERVER
         try:
-            return bool(self.mt5.initialize(**options))
+            ok = bool(self.mt5.initialize(**options))
+            if ok:
+                self._dom_subscribed.clear()
+            return ok
         except Exception:
             return False
 
@@ -1362,10 +1372,24 @@ class Broker:
         return float(value)
 
     def market_book(self, symbol, ttl_sec=5.0):
+        if symbol in self._dom_unsupported:
+            return None
         now = time.time()
         cached = self._dom_cache.get(symbol)
         if cached is not None and (now - cached[0]) <= ttl_sec:
             return cached[1]
+        if symbol not in self._dom_subscribed:
+            try:
+                added = self.read(f"mt5.market_book_add({symbol!r})")
+                if added:
+                    self._dom_subscribed.add(symbol)
+                else:
+                    self._dom_unsupported.add(symbol)
+                    self._dom_cache[symbol] = (now, None)
+                    return None
+            except Exception:
+                self._dom_unsupported.add(symbol)
+                return None
         book = self.read(f"mt5.market_book_get({symbol!r})")
         self._dom_cache[symbol] = (now, book)
         return book
@@ -1412,6 +1436,12 @@ class Broker:
         return list(self.active_symbols)
 
     def shutdown(self):
+        for sym in list(getattr(self, "_dom_subscribed", ())):
+            try:
+                self.read(f"mt5.market_book_release({sym!r})")
+            except Exception:
+                pass
+        self._dom_subscribed.clear()
         self.mt5.shutdown()
 
 
@@ -2143,7 +2173,17 @@ def get_news_sentiment_score(symbol, side, m5_bars=None):
             favorable_side = "NEUTRAL"
             surprise_mult = 1.0
 
-            if act_val is not None and ref_val is not None and abs(act_val - ref_val) > 1e-12:
+            is_fx_or_direct_pair = (
+                base_currency != "IDX"
+                and cur in {base_currency, quote_currency}
+            )
+
+            if (
+                is_fx_or_direct_pair
+                and act_val is not None
+                and ref_val is not None
+                and abs(act_val - ref_val) > 1e-12
+            ):
                 inverse = is_inverse_indicator(title)
                 if act_val > ref_val:
                     currency_bias = "BEARISH" if inverse else "BULLISH"
@@ -3718,7 +3758,8 @@ def in_session_for_symbol(symbol):
         return True
 
     now_utc = utc_now()
-    if now_utc.weekday() == 5 or (now_utc.weekday() == 6 and now_utc.hour < 22):
+    fx_reopen_hour = base_fx_sunday_reopen_hour_utc(now_utc)
+    if now_utc.weekday() == 5 or (now_utc.weekday() == 6 and now_utc.hour < fx_reopen_hour):
         return False
     if is_friday_weekend_close_window(symbol):
         return False
@@ -3964,27 +4005,27 @@ def manage_positions(broker, state, path):
                 )
                 return
 
-                if (
-                    CFG.ENABLE_TIME_EXIT
-                    and not record.get("partial_done", False)
-                    and age_seconds >= effective_exit_min * 60
-                    and current_r < CFG.TIME_EXIT_MIN_R
-                ):
-                    request = partial_request(broker, position, volume)
+            if (
+                CFG.ENABLE_TIME_EXIT
+                and not record.get("partial_done", False)
+                and age_seconds >= effective_exit_min * 60
+                and current_r < CFG.TIME_EXIT_MIN_R
+            ):
+                request = partial_request(broker, position, volume)
 
-                    execute_request(
-                        broker,
-                        state,
-                        path,
-                        "FULL_CLOSE",
-                        request,
-                        {
-                            "position_id": pid,
-                            "reason": "TIME_EXIT",
-                            "current_r": current_r,
-                        },
-                    )
-                    return
+                execute_request(
+                    broker,
+                    state,
+                    path,
+                    "FULL_CLOSE",
+                    request,
+                    {
+                        "position_id": pid,
+                        "reason": "TIME_EXIT",
+                        "current_r": current_r,
+                    },
+                )
+                return
 
             target1 = (
                 entry + CFG.TP1_RR * initial_risk
@@ -4430,9 +4471,10 @@ def main():
                     news_blocked_symbols = []
 
                     now_utc_scan = utc_now()
+                    fx_reopen_hour_scan = base_fx_sunday_reopen_hour_utc(now_utc_scan)
                     is_fx_weekend_closed = (
                         now_utc_scan.weekday() == 5
-                        or (now_utc_scan.weekday() == 6 and now_utc_scan.hour < 22)
+                        or (now_utc_scan.weekday() == 6 and now_utc_scan.hour < fx_reopen_hour_scan)
                         or is_friday_weekend_close_window(None)
                     )
 
