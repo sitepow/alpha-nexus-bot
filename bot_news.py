@@ -17,6 +17,8 @@ INVERSE_ECONOMIC_KEYWORDS = (
     "claims",
     "claimant",
     "layoffs",
+    "budget deficit",
+    "crude oil inventories",
 )
 
 SUPER_HIGH_IMPACT_KEYWORDS = (
@@ -65,26 +67,16 @@ def parse_economic_number(raw_value):
     if not text:
         return None
 
-    multiplier = 1.0
-    if text.endswith("K"):
-        multiplier = 1e3
-        text = text[:-1]
-    elif text.endswith("M"):
-        multiplier = 1e6
-        text = text[:-1]
-    elif text.endswith("B"):
-        multiplier = 1e9
-        text = text[:-1]
-    elif text.endswith("T"):
-        multiplier = 1e12
-        text = text[:-1]
-
     text = text.replace("%", "").replace("$", "").replace("€", "").replace("£", "").strip()
-    match = re.search(r"[-+]?\d*\.?\d+", text)
-    if not match or match.group(0) in {"", "-", "+", "."}:
+    match = re.search(r"([-+]?\d*\.?\d+)\s*([KMBT])?(?![A-Z])", text)
+    if not match or match.group(1) in {"", "-", "+", "."}:
         return None
+
+    unit = match.group(2) or ""
+    mult_map = {"": 1.0, "K": 1e3, "M": 1e6, "B": 1e9, "T": 1e12}
+    multiplier = mult_map.get(unit, 1.0)
     try:
-        return float(match.group(0)) * multiplier
+        return float(match.group(1)) * multiplier
     except ValueError:
         return None
 
@@ -291,9 +283,17 @@ class NewsFetcher:
     @staticmethod
     def map_symbol_currencies(symbol: str):
         raw = str(symbol).strip()
-        for suf in (".pro", ".raw", ".std", ".ecn", ".a", ".b", ".c", ".i", "_i"):
+        for suf in (
+            ".pro", ".raw", ".std", ".ecn", ".cash", ".micro", ".mini",
+            "_ecn", "_pro", "_raw", "_m", "_i",
+            ".m", ".a", ".b", ".c", ".i", ".g", "#", "+", "-",
+        ):
             if raw.lower().endswith(suf):
                 raw = raw[: -len(suf)]
+                break
+        for word_suf in ("micro", "mini", "cash"):
+            if len(raw) > 6 and raw.lower().endswith(word_suf):
+                raw = raw[: -len(word_suf)]
                 break
         if len(raw) >= 6 and raw.endswith(("m", "c")) and raw[:-1].isupper():
             raw = raw[:-1]

@@ -85,20 +85,41 @@ def is_weekend(symbols=None):
     return not any(is_crypto_symbol(sym) for sym in active_list)
 
 
-def is_monday_opening_gap_window(symbol):
+def is_monday_opening_gap_window(symbol, m5_bars=None):
     if is_crypto_symbol(symbol):
         return False
     cooldown_mins = int(getattr(CFG, "MONDAY_OPEN_COOLDOWN_MINUTES", 30))
     if cooldown_mins <= 0:
         return False
+
+    now_ts = time.time()
+    if m5_bars and len(m5_bars) >= 12:
+        recent_bars = m5_bars[-12:]
+        for idx in range(len(recent_bars) - 1, 0, -1):
+            gap_sec = int(recent_bars[idx]["time"]) - int(recent_bars[idx - 1]["time"])
+            if gap_sec >= 7200:
+                reopen_open_ts = float(recent_bars[idx]["time"])
+                mins_since_reopen = (now_ts - reopen_open_ts) / 60.0
+                if 0.0 <= mins_since_reopen < cooldown_mins:
+                    return True
+                break
+
     now = utc_now()
+    base_c, _, _ = NewsFetcher.map_symbol_currencies(str(symbol))
+    clean_s = re.sub(r"[^A-Z0-9]", "", str(symbol).upper())
+    is_late_reopen_asset = (
+        base_c in {"XAU", "XAG", "XPT", "XPD", "IDX"}
+        or any(k in clean_s for k in ("USOIL", "UKOIL", "WTI", "BRENT", "XTI", "XBR", "XNG"))
+    )
+    reopen_hour_utc = 23 if is_late_reopen_asset else 22
+
     if now.weekday() == 6:
-        if now.hour < 22:
+        if now.hour < reopen_hour_utc:
             return True
-        minutes_since_reopen = (now.hour - 22) * 60 + now.minute
+        minutes_since_reopen = (now.hour - reopen_hour_utc) * 60 + now.minute
         return minutes_since_reopen < cooldown_mins
     if now.weekday() == 0:
-        minutes_since_sunday_reopen = 120 + now.hour * 60 + now.minute
+        minutes_since_sunday_reopen = (24 - reopen_hour_utc + now.hour) * 60 + now.minute
         return minutes_since_sunday_reopen < cooldown_mins
     return False
 
@@ -532,7 +553,7 @@ def safe_text(text):
     return "".join(
         char
         for char in str(text)
-        if char in "\n\t" or 32 <= ord(char) <= 126
+        if char in "\n\t" or (ord(char) >= 32 and ord(char) != 127)
     )
 
 
@@ -564,21 +585,23 @@ def get_dynamic_sweep_atr(symbol, base_atr):
     return base_atr * multiplier
 
 def check_trendline_liquidity_sweep(bars, zone_side):
-    highs, lows = swings(bars, 2)
+    if len(bars) < 10:
+        return False
+    highs, lows = swings(bars[:-1], 2)
     if len(highs) < 3 or len(lows) < 3:
         return False
 
     buy = zone_side == "BUY"
     latest_bar = bars[-1]
-    prev_bar = bars[-2]
+    recent_window = bars[-4:-1]
 
     if buy:
         recent_low = min(l["price"] for l in lows[-3:])
-        swept = prev_bar["low"] < recent_low and latest_bar["close"] > recent_low
+        swept = any(b["low"] < recent_low for b in recent_window) and latest_bar["close"] > recent_low
         return swept
     else:
         recent_high = max(h["price"] for h in highs[-3:])
-        swept = prev_bar["high"] > recent_high and latest_bar["close"] < recent_high
+        swept = any(b["high"] > recent_high for b in recent_window) and latest_bar["close"] < recent_high
         return swept
 
 def calculate_pdh_pdl(broker, symbol):
@@ -588,24 +611,31 @@ def calculate_pdh_pdl(broker, symbol):
     if not daily_bars:
         return None, None
 
+    if is_crypto_symbol(symbol):
+        return daily_bars[-1]["high"], daily_bars[-1]["low"]
+
     srv_offset = int(round(getattr(broker, "_server_offset_sec", 0.0)))
 
-    def _bar_server_weekday(bar_item):
-        return datetime.fromtimestamp(int(bar_item["time"]) + srv_offset, tz=timezone.utc).weekday()
+    def _bar_trading_weekday(bar_item):
+        raw_srv_ts = int(bar_item["time"]) + srv_offset
+        dt_srv = datetime.fromtimestamp(raw_srv_ts, tz=timezone.utc)
+        if dt_srv.weekday() == 6 and dt_srv.hour >= 21:
+            return 0
+        return dt_srv.weekday()
 
     ranges = [
         b["high"] - b["low"]
         for b in daily_bars
         if (b["high"] - b["low"]) > 0
-        and _bar_server_weekday(b) not in {5, 6}
+        and _bar_trading_weekday(b) not in {5, 6}
     ]
     avg_range = (sum(ranges) / len(ranges)) if ranges else 0.0
 
     chosen_day = daily_bars[-1]
     for bar in reversed(daily_bars):
-        wd = _bar_server_weekday(bar)
+        wd = _bar_trading_weekday(bar)
         bar_range = bar["high"] - bar["low"]
-        if wd == 6 or (wd == 5 and not is_crypto_symbol(symbol)):
+        if wd in {5, 6}:
             continue
         if avg_range > 0 and bar_range < avg_range * 0.25:
             continue
@@ -639,41 +669,42 @@ def _risk_asset_group(symbol):
     return None
 
 
-def currency_exposure_ok(symbol, side, active_positions):
+def currency_exposure_ok(symbol, side, active_positions, buy_type_const=0):
     max_per_cur = int(getattr(CFG, "MAX_POSITIONS_PER_CURRENCY", 2))
     if max_per_cur <= 0 or not active_positions:
         return True
 
+    cand_rg = _risk_asset_group(symbol)
     base_c, quote_c, _ = SHARED_NEWS_FETCHER.map_symbol_currencies(symbol)
     new_dir = {}
-    if base_c and base_c != "IDX":
-        new_dir[base_c] = 1 if side == "BUY" else -1
-    if quote_c:
-        new_dir[quote_c] = -1 if side == "BUY" else 1
+    if not cand_rg:
+        if base_c and base_c != "IDX":
+            new_dir[base_c] = 1 if side == "BUY" else -1
+        if quote_c:
+            new_dir[quote_c] = -1 if side == "BUY" else 1
 
     exposure_counts = {}
     risk_group_counts = {}
     for pos in active_positions:
         p_sym = pos.get("symbol", "")
-        p_buy = int(pos.get("type", 0)) == 0
-        b_c, q_c, _ = SHARED_NEWS_FETCHER.map_symbol_currencies(p_sym)
-        if b_c and b_c != "IDX":
-            d = 1 if p_buy else -1
-            exposure_counts[(b_c, d)] = exposure_counts.get((b_c, d), 0) + 1
-        if q_c:
-            d = -1 if p_buy else 1
-            exposure_counts[(q_c, d)] = exposure_counts.get((q_c, d), 0) + 1
-
+        p_buy = int(pos.get("type", 0)) == int(buy_type_const)
         rg = _risk_asset_group(p_sym)
         if rg:
             rg_dir = 1 if p_buy else -1
             risk_group_counts[(rg, rg_dir)] = risk_group_counts.get((rg, rg_dir), 0) + 1
+        else:
+            b_c, q_c, _ = SHARED_NEWS_FETCHER.map_symbol_currencies(p_sym)
+            if b_c and b_c != "IDX":
+                d = 1 if p_buy else -1
+                exposure_counts[(b_c, d)] = exposure_counts.get((b_c, d), 0) + 1
+            if q_c:
+                d = -1 if p_buy else 1
+                exposure_counts[(q_c, d)] = exposure_counts.get((q_c, d), 0) + 1
 
     for cur, d in new_dir.items():
         if exposure_counts.get((cur, d), 0) >= max_per_cur:
             return False
 
-    cand_rg = _risk_asset_group(symbol)
     max_rg = int(getattr(CFG, "MAX_RISK_GROUP_EXPOSURE", 2))
     if cand_rg and max_rg > 0:
         cand_rg_dir = 1 if side == "BUY" else -1
@@ -1120,6 +1151,25 @@ class Broker:
     def info(self, symbol):
         return self.named(f"mt5.symbol_info({symbol!r})")
 
+    def ensure_connected(self):
+        try:
+            term = self.terminal()
+            if term and term.get("connected", False):
+                return True
+        except Exception:
+            pass
+        options = {}
+        if CFG.MT5_LOGIN > 0:
+            options["login"] = CFG.MT5_LOGIN
+        if CFG.MT5_PASSWORD:
+            options["password"] = CFG.MT5_PASSWORD
+        if CFG.MT5_SERVER:
+            options["server"] = CFG.MT5_SERVER
+        try:
+            return bool(self.mt5.initialize(**options))
+        except Exception:
+            return False
+
     def update_server_offset(self, raw_server_ts, max_Select_drift_sec=90.0):
         if raw_server_ts is None or float(raw_server_ts) <= 0:
             return self._server_offset_sec
@@ -1131,15 +1181,20 @@ class Broker:
 
     def calibrate_server_offset(self):
         offsets = []
-        probe_list = (self.active_symbols or CFG.SYMBOLS)[:8]
-        for sym in probe_list:
+        all_syms = list(self.active_symbols or CFG.SYMBOLS)
+        crypto_first = [s for s in all_syms if is_crypto_symbol(s)] + [s for s in all_syms if not is_crypto_symbol(s)]
+        for sym in crypto_first:
             try:
                 raw_tick = self.named(f"mt5.symbol_info_tick({sym!r})")
-                ts = tick_timestamp(raw_tick)
-                diff = float(ts) - time.time()
+                ts = float(raw_tick.get("time", 0))
+                if ts <= 0:
+                    continue
+                diff = ts - time.time()
                 nh = round(diff / 1800.0) * 1800.0
                 if abs(nh) <= 14 * 3600 and abs(diff - nh) <= 90.0:
                     offsets.append(float(nh))
+                    if len(offsets) >= 5:
+                        break
             except Exception:
                 continue
         if offsets:
@@ -1154,8 +1209,10 @@ class Broker:
         tick = self.named(f"mt5.symbol_info_tick({symbol!r})")
         bid = float(tick["bid"])
         ask = float(tick["ask"])
-        raw_stamp = tick_timestamp(tick)
-        self.update_server_offset(raw_stamp)
+        srv_sec = float(tick.get("time", 0))
+        if srv_sec > 0:
+            self.update_server_offset(srv_sec)
+        raw_stamp = srv_sec if srv_sec > 0 else tick_timestamp(tick)
         stamp = self.to_utc_ts(raw_stamp)
         age = time.time() - stamp
 
@@ -1317,7 +1374,7 @@ class Broker:
 
         for symbol in CFG.SYMBOLS:
             chosen = None
-            for candidate_sym in (symbol, f"{symbol}m", f"{symbol}.a", f"{symbol}.pro", f"{symbol}.raw"):
+            for candidate_sym in (symbol, f"{symbol}m", f"{symbol}.m", f"{symbol}.a", f"{symbol}.c", f"{symbol}.pro", f"{symbol}.raw", f"{symbol}.ecn", f"{symbol}.cash", f"{symbol}#"):
                 try:
                     success = self.read(f"mt5.symbol_select({candidate_sym!r}, True)")
                     if not success:
@@ -1740,20 +1797,21 @@ def create_zones(symbol, bars, side):
             if not (pd_zone_bottom <= midpoint <= pd_zone_top):
                 return
 
-            subsequent_m15 = bars[final_index + 1 : -3] if final_index + 1 < len(bars) - 3 else []
+            all_subsequent_m15 = bars[final_index + 1 :] if final_index + 1 < len(bars) else []
             inv_buf = reference_atr * 0.15
+            for m_bar in all_subsequent_m15:
+                if buy and m_bar["close"] < bottom - inv_buf:
+                    return
+                if not buy and m_bar["close"] > top + inv_buf:
+                    return
+
+            subsequent_m15 = bars[final_index + 1 : -3] if final_index + 1 < len(bars) - 3 else []
             prior_deep_touches = 0
             for m_bar in subsequent_m15:
-                if buy:
-                    if m_bar["close"] < bottom - inv_buf:
-                        return
-                    if m_bar["low"] <= midpoint:
-                        prior_deep_touches += 1
-                else:
-                    if m_bar["close"] > top + inv_buf:
-                        return
-                    if m_bar["high"] >= midpoint:
-                        prior_deep_touches += 1
+                if buy and m_bar["low"] <= midpoint:
+                    prior_deep_touches += 1
+                elif not buy and m_bar["high"] >= midpoint:
+                    prior_deep_touches += 1
 
             if prior_deep_touches >= 2:
                 return
@@ -2150,6 +2208,16 @@ def scan_symbol(broker, symbol, state):
     if age < 0 or age > CFG.MAX_CLOSED_M5_AGE_SECONDS:
         return None
 
+    if is_monday_opening_gap_window(symbol, m5_bars=m5):
+        SYMBOL_RADAR_STATE[symbol] = {
+            "category": "BLOCKED",
+            "side": "NEUTRAL",
+            "regime": "OPEN_COOLDOWN",
+            "stage": "MONDAY_GAP_COOLDOWN",
+            "detail": "Market reopen gap cooldown",
+        }
+        return None
+
     h4 = broker.bars(
         symbol, broker.constant("TIMEFRAME_H4"), CFG.H4_BAR_COUNT
     )
@@ -2339,7 +2407,7 @@ def scan_symbol(broker, symbol, state):
             if candidate["side"] == side
             else get_news_sentiment_score(symbol, candidate["side"], m5_bars=m5)
         )
-        candidate["score"] += news_sentiment
+        candidate["score"] = min(12.0, candidate["score"] + news_sentiment)
 
     mom_min_threshold = max(CFG.MIN_SCORING_THRESHOLD + 1.5, 7.5)
     eligible = [
@@ -3138,8 +3206,10 @@ def resolve_pending(broker, state, path):
             state["pending"] = None
             atomic_save(path, state)
 
+            exit_reason_tag = pending["metadata"].get("reason", "FULL_CLOSE")
+            exit_label = "Friday weekend-exit" if exit_reason_tag == "FRIDAY_WEEKEND_EXIT" else "Time-exit"
             notify(
-                f"Time-exit fill confirmed. Symbol: {request['symbol']}\n"
+                f"{exit_label} fill confirmed. Symbol: {request['symbol']}\n"
                 f"Closed volume: {closed_volume:.8f}"
             )
             return
@@ -3204,11 +3274,51 @@ def resolve_pending(broker, state, path):
             return
 
         if kind == "ENTRY":
-            sym_has_bot_pos = any(
-                item["symbol"] == request["symbol"] and int(item.get("magic", 0)) == CFG.MAGIC
-                for item in positions
-            )
-            if not sym_has_bot_pos:
+            untracked_live = [
+                item for item in positions
+                if item["symbol"] == request["symbol"]
+                and int(item.get("magic", 0)) == CFG.MAGIC
+                and position_identifier(item) not in state["positions"]
+            ]
+            if len(untracked_live) == 1:
+                pos_item = untracked_live[0]
+                pid = position_identifier(pos_item)
+                entry_p = float(pos_item.get("price_open", request["price"]))
+                stop_p = float(pos_item.get("sl") or request["sl"])
+                tp_p = float(pos_item.get("tp") or request["tp"])
+                vol_p = float(pos_item.get("volume", request["volume"]))
+                side_p = pending["metadata"]["side"]
+                init_risk = (entry_p - stop_p) if side_p == "BUY" else (stop_p - entry_p)
+                zone_id_meta = pending["metadata"].get("zone_id")
+                if zone_id_meta:
+                    state["seen_zones"][zone_id_meta] = time.time()
+                state["positions"][pid] = {
+                    "symbol": request["symbol"],
+                    "side": side_p,
+                    "entry": entry_p,
+                    "initial_sl": stop_p,
+                    "last_sl": stop_p,
+                    "initial_risk": max(init_risk, CFG.EPSILON),
+                    "initial_volume": vol_p,
+                    "initial_tp": tp_p,
+                    "partial_done": False,
+                    "opened_at": broker.to_utc_ts(float(pos_item.get("time", time.time()))),
+                    "zone_id": zone_id_meta,
+                }
+                state["pending"] = None
+                atomic_save(path, state)
+                notify(f"Stale ENTRY reconciled from live MT5 position on {request['symbol']} (ticket {pid}).")
+                return
+
+            if not untracked_live:
+                zone_id_meta = pending["metadata"].get("zone_id")
+                recent_deals = broker.history(pending["created"] - 60, time.time() + 5)
+                comment_deals = [
+                    d for d in recent_deals
+                    if str(d.get("comment", "")) == request["comment"]
+                ]
+                if comment_deals and zone_id_meta:
+                    state["seen_zones"][zone_id_meta] = time.time()
                 state["pending"] = None
                 atomic_save(path, state)
                 notify(f"Stale unacknowledged ENTRY cleared after {pending_age:.0f}s (no open position or deal).")
@@ -3447,6 +3557,8 @@ def send_daily_summary_report(broker, report_day, prev_start_balance, current_ba
         return
     try:
         day_start_dt = datetime.strptime(report_day, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        if (utc_now().date() - day_start_dt.date()).days > 2:
+            return
         start_ts = day_start_dt.timestamp()
         end_ts = start_ts + 86400.0
         deals = broker.history(start_ts, end_ts)
@@ -3455,27 +3567,23 @@ def send_daily_summary_report(broker, report_day, prev_start_balance, current_ba
             broker.constant("DEAL_ENTRY_OUT"),
             broker.constant("DEAL_ENTRY_OUT_BY"),
         }
-        pnl_by_pos = {}
-        sym_by_pos = {}
-        for deal in deals:
-            if not trade_deal(broker, deal):
-                continue
-            if int(deal.get("magic", 0)) != CFG.MAGIC and int(deal.get("entry", -1)) not in exit_types:
-                continue
-            pid = str(int(deal.get("position_id", 0)))
-            if pid == "0":
-                continue
-            pnl_by_pos[pid] = pnl_by_pos.get(pid, 0.0) + deal_cash(deal)
-            if deal.get("symbol"):
-                sym_by_pos[pid] = str(deal["symbol"])
+        candidate_pids = {
+            str(int(d.get("position_id", 0)))
+            for d in deals
+            if trade_deal(broker, d)
+            and int(d.get("entry", -1)) in exit_types
+            and int(d.get("position_id", 0)) > 0
+        }
 
-        closed_positions = [
-            (pid, pnl) for pid, pnl in pnl_by_pos.items()
-            if any(
-                str(int(d.get("position_id", 0))) == pid and int(d.get("entry", -1)) in exit_types
-                for d in deals
-            )
-        ]
+        closed_positions = []
+        for pid in candidate_pids:
+            pos_deals = broker.position_deals(int(pid))
+            if not pos_deals:
+                continue
+            if not any(int(pd.get("magic", 0)) == CFG.MAGIC for pd in pos_deals):
+                continue
+            pnl = sum(deal_cash(pd) for pd in pos_deals if trade_deal(broker, pd))
+            closed_positions.append((pid, pnl))
 
         total_trades = len(closed_positions)
         wins = sum(1 for _, pnl in closed_positions if pnl > CFG.EPSILON)
@@ -3508,14 +3616,13 @@ def daily_snapshot(broker, state, path):
         broker.constant("DEAL_TYPE_CORRECTION"),
     }
 
-    external_cash_flow = any(
-        int(deal.get("type", -1)) in cash_flow_types
-        and abs(deal_cash(deal)) > CFG.EPSILON
-        for deal in deals
-    )
-
     today = utc_now().date().isoformat()
     total_cash = sum(deal_cash(deal) for deal in deals)
+    realized = sum(
+        deal_cash(deal)
+        for deal in deals
+        if int(deal.get("type", -1)) not in cash_flow_types
+    )
 
     cur_bal = float(account.get("balance", 0.0))
     prev_peak = float(state.get("peak_balance") or 0.0)
@@ -3526,10 +3633,10 @@ def daily_snapshot(broker, state, path):
     if state["day"] != today:
         prev_day = state.get("day", "")
         prev_start_balance = state.get("day_start_balance")
-        new_start_balance = float(account["balance"]) - total_cash
+        new_start_balance = cur_bal - total_cash
 
         state["day"] = today
-        state["day_start_balance"] = new_start_balance
+        state["day_start_balance"] = cur_bal - realized
         state["daily_loss_latched"] = False
         state["dry_run_entries"] = 0
 
@@ -3544,18 +3651,15 @@ def daily_snapshot(broker, state, path):
         if prev_day:
             send_daily_summary_report(broker, prev_day, prev_start_balance, new_start_balance)
 
-    realized = sum(
-        deal_cash(deal)
-        for deal in deals
-        if int(deal.get("type", -1)) not in cash_flow_types
-    )
+    expected_start_bal = cur_bal - realized
+    if expected_start_bal > 0 and abs(float(state.get("day_start_balance") or 0.0) - expected_start_bal) > 0.05:
+        state["day_start_balance"] = expected_start_bal
+        atomic_save(path, state)
 
-    floating = float(account["equity"]) - float(account["balance"])
+    floating = float(account["equity"]) - cur_bal
     daily_pnl = realized + floating
     baseline = float(state["day_start_balance"] or 0.0)
-
-    if baseline <= 0:
-        external_cash_flow = True
+    external_cash_flow = baseline <= 0
 
     if (
         baseline > 0
@@ -3792,62 +3896,63 @@ def manage_positions(broker, state, path):
         return
 
     for position in broker.positions():
-        pid = position_identifier(position)
-        record = state["positions"].get(pid)
+        try:
+            pid = position_identifier(position)
+            record = state["positions"].get(pid)
 
-        if record is None:
-            continue
+            if record is None:
+                continue
 
-        symbol = position["symbol"]
-        info = broker.info(symbol)
-        tick = broker.tick(symbol)
+            symbol = position["symbol"]
+            info = broker.info(symbol)
+            tick = broker.tick(symbol)
 
-        buy = record["side"] == "BUY"
-        entry = float(record["entry"])
-        initial_risk = float(record["initial_risk"])
-        volume = float(position["volume"])
+            buy = record["side"] == "BUY"
+            entry = float(record["entry"])
+            initial_risk = float(record["initial_risk"])
+            volume = float(position["volume"])
 
-        if initial_risk <= 0:
-            mark_halt(
-                state, path,
-                "A tracked position has invalid initial risk.",
+            if initial_risk <= 0:
+                mark_halt(
+                    state, path,
+                    "A tracked position has invalid initial risk.",
+                )
+                return
+
+            price = float(tick["bid"] if buy else tick["ask"])
+            current_r = (
+                (price - entry) / initial_risk
+                if buy
+                else (entry - price) / initial_risk
             )
-            return
 
-        price = float(tick["bid"] if buy else tick["ask"])
-        current_r = (
-            (price - entry) / initial_risk
-            if buy
-            else (entry - price) / initial_risk
-        )
-
-        age_seconds = time.time() - float(record["opened_at"])
-        base_exit_min = float(CFG.TIME_EXIT_MINUTES)
-        if getattr(CFG, "USE_DYNAMIC_TIME_EXIT", True):
-            if current_r >= 0.05 or is_prime_killzone_utc():
-                effective_exit_min = base_exit_min * 1.35
-            elif current_r <= -0.35:
-                effective_exit_min = max(45.0, base_exit_min * 0.72)
+            age_seconds = time.time() - float(record["opened_at"])
+            base_exit_min = float(CFG.TIME_EXIT_MINUTES)
+            if getattr(CFG, "USE_DYNAMIC_TIME_EXIT", True):
+                if current_r >= 0.05 or is_prime_killzone_utc():
+                    effective_exit_min = base_exit_min * 1.35
+                elif current_r <= -0.35:
+                    effective_exit_min = max(45.0, base_exit_min * 0.72)
+                else:
+                    effective_exit_min = base_exit_min
             else:
                 effective_exit_min = base_exit_min
-        else:
-            effective_exit_min = base_exit_min
 
-        if is_friday_weekend_close_window(symbol):
-            request = partial_request(broker, position, volume)
-            execute_request(
-                broker,
-                state,
-                path,
-                "FULL_CLOSE",
-                request,
-                {
-                    "position_id": pid,
-                    "reason": "FRIDAY_WEEKEND_EXIT",
-                    "current_r": current_r,
-                },
-            )
-            return
+            if is_friday_weekend_close_window(symbol):
+                request = partial_request(broker, position, volume)
+                execute_request(
+                    broker,
+                    state,
+                    path,
+                    "FULL_CLOSE",
+                    request,
+                    {
+                        "position_id": pid,
+                        "reason": "FRIDAY_WEEKEND_EXIT",
+                        "current_r": current_r,
+                    },
+                )
+                return
 
         if (
             CFG.ENABLE_TIME_EXIT
@@ -3871,139 +3976,141 @@ def manage_positions(broker, state, path):
             )
             return
 
-        target1 = (
-            entry + CFG.TP1_RR * initial_risk
-            if buy
-            else entry - CFG.TP1_RR * initial_risk
-        )
-
-        reached = price >= target1 if buy else price <= target1
-
-        if (
-            volume < float(record["initial_volume"]) - CFG.EPSILON
-            and not record["partial_done"]
-        ):
-            record["partial_done"] = True
-            atomic_save(path, state)
-            notify(
-                f"Existing volume reduction detected. Symbol: {symbol}\n"
-                "The bot will not repeat the partial close."
+            target1 = (
+                entry + CFG.TP1_RR * initial_risk
+                if buy
+                else entry - CFG.TP1_RR * initial_risk
             )
 
-        if reached and not record["partial_done"]:
-            step = float(info["volume_step"])
-            minimum = float(info["volume_min"])
-
-            closing = floor_volume(volume / 2.0, step)
-            remaining = round(volume - closing, 10)
+            reached = price >= target1 if buy else price <= target1
 
             if (
-                closing + CFG.EPSILON >= minimum
-                and remaining + CFG.EPSILON >= minimum
+                volume < float(record["initial_volume"]) - CFG.EPSILON
+                and not record["partial_done"]
             ):
-                request = partial_request(
-                    broker, position, closing
+                record["partial_done"] = True
+                atomic_save(path, state)
+                notify(
+                    f"Existing volume reduction detected. Symbol: {symbol}\n"
+                    "The bot will not repeat the partial close."
                 )
 
-                execute_request(
-                    broker,
-                    state,
-                    path,
-                    "PARTIAL",
-                    request,
-                    {"position_id": pid},
-                )
-                return
+            if reached and not record["partial_done"]:
+                step = float(info["volume_step"])
+                minimum = float(info["volume_min"])
 
-            record["partial_done"] = True
-            atomic_save(path, state)
-            notify(
-                f"Partial close skipped. Symbol: {symbol}\n"
-                "Broker volume limits prevent a valid split. "
-                "Stop management remains enabled."
-            )
+                closing = floor_volume(volume / 2.0, step)
+                remaining = round(volume - closing, 10)
 
-        be_trigger_r = float(getattr(CFG, "BREAKEVEN_TRIGGER_RR", 1.0))
-        stage1_lock_r = float(getattr(CFG, "STAGE1_REDUCE_RISK_RR", -0.35))
-        be_lock_r = float(getattr(CFG, "BREAKEVEN_LOCK_RR", 0.10))
-        if not record["partial_done"]:
-            if current_r >= be_trigger_r:
-                stage1_sl = (
-                    entry + (stage1_lock_r * initial_risk)
-                    if buy
-                    else entry - (stage1_lock_r * initial_risk)
-                )
-                be_req = stop_request(broker, pid, stage1_sl)
-                if be_req is not None:
+                if (
+                    closing + CFG.EPSILON >= minimum
+                    and remaining + CFG.EPSILON >= minimum
+                ):
+                    request = partial_request(
+                        broker, position, closing
+                    )
+
                     execute_request(
                         broker,
                         state,
                         path,
-                        "MODIFY_SL",
-                        be_req,
+                        "PARTIAL",
+                        request,
                         {"position_id": pid},
                     )
                     return
+
+                record["partial_done"] = True
+                atomic_save(path, state)
+                notify(
+                    f"Partial close skipped. Symbol: {symbol}\n"
+                    "Broker volume limits prevent a valid split. "
+                    "Stop management remains enabled."
+                )
+
+            be_trigger_r = float(getattr(CFG, "BREAKEVEN_TRIGGER_RR", 1.0))
+            stage1_lock_r = float(getattr(CFG, "STAGE1_REDUCE_RISK_RR", -0.35))
+            be_lock_r = float(getattr(CFG, "BREAKEVEN_LOCK_RR", 0.10))
+            if not record["partial_done"]:
+                if current_r >= be_trigger_r:
+                    stage1_sl = (
+                        entry + (stage1_lock_r * initial_risk)
+                        if buy
+                        else entry - (stage1_lock_r * initial_risk)
+                    )
+                    be_req = stop_request(broker, pid, stage1_sl)
+                    if be_req is not None:
+                        execute_request(
+                            broker,
+                            state,
+                            path,
+                            "MODIFY_SL",
+                            be_req,
+                            {"position_id": pid},
+                        )
+                        return
+                continue
+
+            bars = broker.bars(
+                symbol, broker.constant("TIMEFRAME_M5"), 100
+            )
+
+            closed_time = bars[-1]["time"] + 300
+            bar_age = time.time() - closed_time
+
+            if (
+                bar_age < 0
+                or bar_age > CFG.MAX_CLOSED_M5_AGE_SECONDS
+            ):
+                continue
+
+            volatility = atr(bars)[-1]
+
+            if volatility <= 0:
+                continue
+
+            highs, lows = swings(bars, CFG.LTF_SWING_WINDOW)
+            buffer = CFG.SL_BUFFER_ATR * volatility
+            be_floor = (
+                entry + (be_lock_r * initial_risk)
+                if buy
+                else entry - (be_lock_r * initial_risk)
+            )
+            desired_sl = be_floor
+
+            if buy:
+                valid_lows = [l["price"] for l in lows if l["price"] < price]
+                if valid_lows:
+                    structural_sl = valid_lows[-1] - buffer
+                    desired_sl = max(desired_sl, structural_sl)
+                atr_trail = price - (CFG.TRAIL_ATR * volatility)
+                if atr_trail > entry:
+                    desired_sl = max(desired_sl, atr_trail)
+            else:
+                valid_highs = [h["price"] for h in highs if h["price"] > price]
+                if valid_highs:
+                    structural_sl = valid_highs[-1] + buffer
+                    desired_sl = min(desired_sl, structural_sl)
+                atr_trail = price + (CFG.TRAIL_ATR * volatility)
+                if atr_trail < entry:
+                    desired_sl = min(desired_sl, atr_trail)
+
+            request = stop_request(broker, pid, desired_sl)
+
+            if request is None:
+                continue
+
+            execute_request(
+                broker,
+                state,
+                path,
+                "MODIFY_SL",
+                request,
+                {"position_id": pid},
+            )
+            return
+        except SafetyError:
             continue
-
-        bars = broker.bars(
-            symbol, broker.constant("TIMEFRAME_M5"), 100
-        )
-
-        closed_time = bars[-1]["time"] + 300
-        bar_age = time.time() - closed_time
-
-        if (
-            bar_age < 0
-            or bar_age > CFG.MAX_CLOSED_M5_AGE_SECONDS
-        ):
-            continue
-
-        volatility = atr(bars)[-1]
-
-        if volatility <= 0:
-            continue
-
-        highs, lows = swings(bars, CFG.LTF_SWING_WINDOW)
-        buffer = CFG.SL_BUFFER_ATR * volatility
-        be_floor = (
-            entry + (be_lock_r * initial_risk)
-            if buy
-            else entry - (be_lock_r * initial_risk)
-        )
-        desired_sl = be_floor
-
-        if buy:
-            valid_lows = [l["price"] for l in lows if l["price"] < price]
-            if valid_lows:
-                structural_sl = valid_lows[-1] - buffer
-                desired_sl = max(desired_sl, structural_sl)
-            atr_trail = price - (CFG.TRAIL_ATR * volatility)
-            if atr_trail > entry:
-                desired_sl = max(desired_sl, atr_trail)
-        else:
-            valid_highs = [h["price"] for h in highs if h["price"] > price]
-            if valid_highs:
-                structural_sl = valid_highs[-1] + buffer
-                desired_sl = min(desired_sl, structural_sl)
-            atr_trail = price + (CFG.TRAIL_ATR * volatility)
-            if atr_trail < entry:
-                desired_sl = min(desired_sl, atr_trail)
-
-        request = stop_request(broker, pid, desired_sl)
-
-        if request is None:
-            continue
-
-        execute_request(
-            broker,
-            state,
-            path,
-            "MODIFY_SL",
-            request,
-            {"position_id": pid},
-        )
-        return
 
 
 def account_key_from(account):
@@ -4110,10 +4217,15 @@ def emit_smart_market_pulse_radar(active_symbols_list, open_positions, news_bloc
     neutral_count = 0
     sideway_count = 0
 
+    scanning_now_count = 0
     for sym in active_symbols_list:
         if sym in open_sym_Set:
+            scanning_now_count += 1
             sig_parts.append(f"{sym}:OPEN_POS")
             continue
+        if not in_session_for_symbol(sym):
+            continue
+        scanning_now_count += 1
         if sym in news_set:
             sig_parts.append(f"{sym}:NEWS_BLACKOUT")
             continue
@@ -4153,7 +4265,7 @@ def emit_smart_market_pulse_radar(active_symbols_list, open_positions, news_bloc
     LAST_RADAR_SIGNATURE = signature
     LAST_RADAR_SENT_TS = now_ts
 
-    lines = [f"[MARKET PULSE RADAR] Active: {len(active_symbols_list)} symbols"]
+    lines = [f"[MARKET PULSE RADAR] Scanning: {scanning_now_count}/{len(active_symbols_list)} symbols"]
 
     if open_sym_Set:
         lines.append(f"Open Positions ({len(open_sym_Set)}): " + ", ".join(sorted(open_sym_Set)))
@@ -4260,6 +4372,7 @@ def main():
                     time.sleep(min(60.0, float(CFG.POLL_SECONDS)))
                     continue
                 
+                broker.ensure_connected()
                 validate_account(broker, account_key)
                 resolve_pending(broker, state, state_path)
                 reconcile_positions(broker, state, state_path)
@@ -4426,30 +4539,18 @@ def main():
                                 int(state.get("dry_run_entries", 0)) + 1
                             )
                             atomic_save(state_path, state)
-                            if CFG.TELEGRAM_TOKEN and CFG.TELEGRAM_CHAT_ID:
-                                try:
-                                    requests.post(
-                                        f"https://api.telegram.org/bot{CFG.TELEGRAM_TOKEN}/sendMessage",
-                                        json={
-                                            "chat_id": CFG.TELEGRAM_CHAT_ID,
-                                            "text": safe_text(
-                                                f"Dry-run signal (Ranked). Symbol: {symbol}\n"
-                                                f"Side: {candidate['side']}\n"
-                                                f"Zone: {candidate['zone']['kind']}\n"
-                                                f"Score: {candidate['score']:.2f}\n"
-                                                f"Entry estimate: {request['price']:.8f}\n"
-                                                f"Stop: {request['sl']:.8f}\n"
-                                                f"Target: {request['tp']:.8f}\n"
-                                                f"Volume: {request['volume']:.8f}\n"
-                                                f"Estimated risk: {estimated_loss:.2f}\n"
-                                                "No trading request was sent."
-                                            ),
-                                            "disable_web_page_preview": True,
-                                        },
-                                        timeout=10,
-                                    )
-                                except Exception:
-                                    pass
+                            notify(
+                                f"Dry-run signal (Ranked). Symbol: {symbol}\n"
+                                f"Side: {candidate['side']}\n"
+                                f"Zone: {candidate['zone']['kind']}\n"
+                                f"Score: {candidate['score']:.2f}\n"
+                                f"Entry estimate: {request['price']:.8f}\n"
+                                f"Stop: {request['sl']:.8f}\n"
+                                f"Target: {request['tp']:.8f}\n"
+                                f"Volume: {request['volume']:.8f}\n"
+                                f"Estimated risk: {estimated_loss:.2f}\n"
+                                "No trading request was sent."
+                            )
                             continue
 
                         submitted = execute_request(
