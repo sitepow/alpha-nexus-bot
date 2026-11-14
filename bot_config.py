@@ -13,28 +13,52 @@ load_dotenv(ROOT / ".env")
 
 
 def env_bool(name: str, default: bool) -> bool:
-    value = os.getenv(name, str(default)).strip().lower()
+    raw = os.getenv(name)
+    value = (str(default) if raw is None or not raw.strip() else raw).strip().lower()
     if value not in {"true", "false", "1", "0", "yes", "no"}:
         raise ValueError(f"Invalid Boolean configuration: {name}")
     return value in {"true", "1", "yes"}
 
 
 def env_float(name: str, default: float) -> float:
-    value = float(os.getenv(name, str(default)))
+    raw = os.getenv(name)
+    text = str(default) if raw is None or not raw.strip() else raw.strip()
+    try:
+        value = float(text)
+    except ValueError as exc:
+        raise ValueError(f"Invalid float configuration: {name}") from exc
     if not math.isfinite(value):
         raise ValueError(f"Non-finite configuration: {name}")
     return value
 
 
 def env_int(name: str, default: int) -> int:
-    return int(os.getenv(name, str(default)))
+    raw = os.getenv(name)
+    text = str(default) if raw is None or not raw.strip() else raw.strip()
+    try:
+        return int(text)
+    except ValueError as exc:
+        raise ValueError(f"Invalid integer configuration: {name}") from exc
+
+
+def env_json_dict(name: str, default: dict) -> dict:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return dict(default)
+    try:
+        parsed = json.loads(raw)
+    except ValueError as exc:
+        raise ValueError(f"Invalid JSON configuration: {name}") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError(f"JSON object configuration required: {name}")
+    return parsed
 
 
 # ==========================================
 # 1. GENERAL & EXECUTION CONTROL
 # ==========================================
-DRY_RUN = env_bool("DRY_RUN", False)
-ALLOW_LIVE_TRADING = env_bool("ALLOW_LIVE_TRADING", True)
+DRY_RUN = env_bool("DRY_RUN", True)
+ALLOW_LIVE_TRADING = env_bool("ALLOW_LIVE_TRADING", False)
 MAGIC = env_int("MAGIC", 990011)
 STATE_VERSION = 2
 POLL_SECONDS = env_float("POLL_SECONDS", 15)
@@ -73,24 +97,24 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 # ==========================================
 RISK_PER_TRADE = env_float("RISK_PER_TRADE", 10.0)
 USE_DYNAMIC_RISK = env_bool("USE_DYNAMIC_RISK", True)
-RISK_PCT = env_float("RISK_PCT", 1.25)
-MIN_LOT_FALLBACK_MAX_RISK_PCT = env_float("MIN_LOT_FALLBACK_MAX_RISK_PCT", 2.5)
-MAX_OPEN_PORTFOLIO_HEAT_PCT = env_float("MAX_OPEN_PORTFOLIO_HEAT_PCT", 3.0)
+RISK_PCT = env_float("RISK_PCT", 1.0)
+MIN_LOT_FALLBACK_MAX_RISK_PCT = env_float("MIN_LOT_FALLBACK_MAX_RISK_PCT", 1.5)
+MAX_OPEN_PORTFOLIO_HEAT_PCT = env_float("MAX_OPEN_PORTFOLIO_HEAT_PCT", 2.5)
 DRAWDOWN_THROTTLE_SLOPE = env_float("DRAWDOWN_THROTTLE_SLOPE", 5.0)
-COMMISSION_PER_LOT = env_float("COMMISSION_PER_LOT", 0.0)
-MAX_LOT = env_float("MAX_LOT", 5.0)
-MAX_OPEN_POSITIONS = env_int("MAX_OPEN_POSITIONS", 3)
-MAX_POSITIONS_PER_CURRENCY = env_int("MAX_POSITIONS_PER_CURRENCY", 2)
-MAX_RISK_GROUP_EXPOSURE = env_int("MAX_RISK_GROUP_EXPOSURE", 2)
+COMMISSION_PER_LOT = env_float("COMMISSION_PER_LOT", 7.0)
+MAX_LOT = env_float("MAX_LOT", 2.0)
+MAX_OPEN_POSITIONS = env_int("MAX_OPEN_POSITIONS", 2)
+MAX_POSITIONS_PER_CURRENCY = env_int("MAX_POSITIONS_PER_CURRENCY", 1)
+MAX_RISK_GROUP_EXPOSURE = env_int("MAX_RISK_GROUP_EXPOSURE", 1)
 BREAKEVEN_TRIGGER_RR = env_float("BREAKEVEN_TRIGGER_RR", 1.0)
 STAGE1_REDUCE_RISK_RR = env_float("STAGE1_REDUCE_RISK_RR", -0.35)
 BREAKEVEN_LOCK_RR = env_float("BREAKEVEN_LOCK_RR", 0.10)
-MAX_DAILY_TRADES = env_int("MAX_DAILY_TRADES", 8)
+MAX_DAILY_TRADES = env_int("MAX_DAILY_TRADES", 6)
 USE_DYNAMIC_DAILY_TRADES = env_bool("USE_DYNAMIC_DAILY_TRADES", True)
 USE_DYNAMIC_TP_SCALING = env_bool("USE_DYNAMIC_TP_SCALING", True)
 USE_DYNAMIC_TIME_EXIT = env_bool("USE_DYNAMIC_TIME_EXIT", True)
 USE_AUTO_DST_KILLZONES = env_bool("USE_AUTO_DST_KILLZONES", True)
-MAX_DAILY_LOSS_PCT = env_float("MAX_DAILY_LOSS_PCT", 0.05)
+MAX_DAILY_LOSS_PCT = env_float("MAX_DAILY_LOSS_PCT", 0.03)
 MAX_CONSECUTIVE_LOSSES = env_int("MAX_CONSECUTIVE_LOSSES", 3)
 COOLDOWN_SECONDS = env_float("COOLDOWN_SECONDS", 3600)
 
@@ -98,33 +122,31 @@ MAX_SPREAD_POINTS = env_float("MAX_SPREAD_POINTS", 25)
 USE_ATR_NORMALIZED_SPREAD = env_bool("USE_ATR_NORMALIZED_SPREAD", True)
 MAX_SPREAD_ATR_RATIO = env_float("MAX_SPREAD_ATR_RATIO", 0.18)
 MAX_SPREAD_SL_RATIO = env_float("MAX_SPREAD_SL_RATIO", 0.12)
-MAX_SPREAD_BY_SYMBOL = json.loads(
-    os.getenv(
-        "MAX_SPREAD_BY_SYMBOL_JSON",
-        json.dumps({
-            "EURUSD": 20,
-            "USDJPY": 22,
-            "GBPUSD": 25,
-            "AUDUSD": 25,
-            "USDCAD": 25,
-            "NZDUSD": 25,
-            "USDCHF": 25,
-            "EURGBP": 25,
-            "EURJPY": 30,
-            "AUDJPY": 30,
-            "GBPJPY": 35,
-            "EURAUD": 40,
-            "GBPCAD": 40,
-            "XAUUSD": 60,
-            "USOIL": 50,
-            "US30": 300,
-            "USTEC": 250,
-            "US500": 120,
-            "DE30": 180,
-            "BTCUSD": 3000,
-            "ETHUSD": 1200
-        })
-    )
+MAX_SPREAD_BY_SYMBOL = env_json_dict(
+    "MAX_SPREAD_BY_SYMBOL_JSON",
+    {
+        "EURUSD": 20,
+        "USDJPY": 22,
+        "GBPUSD": 25,
+        "AUDUSD": 25,
+        "USDCAD": 25,
+        "NZDUSD": 25,
+        "USDCHF": 25,
+        "EURGBP": 25,
+        "EURJPY": 30,
+        "AUDJPY": 30,
+        "GBPJPY": 35,
+        "EURAUD": 40,
+        "GBPCAD": 40,
+        "XAUUSD": 60,
+        "USOIL": 50,
+        "US30": 300,
+        "USTEC": 250,
+        "US500": 120,
+        "DE30": 180,
+        "BTCUSD": 3000,
+        "ETHUSD": 1200,
+    },
 )
 
 DEVIATION_POINTS = env_int("DEVIATION_POINTS", 20)
