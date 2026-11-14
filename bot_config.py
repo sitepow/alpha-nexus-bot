@@ -57,8 +57,8 @@ def env_json_dict(name: str, default: dict) -> dict:
 # ==========================================
 # 1. GENERAL & EXECUTION CONTROL
 # ==========================================
-DRY_RUN = env_bool("DRY_RUN", True)
-ALLOW_LIVE_TRADING = env_bool("ALLOW_LIVE_TRADING", False)
+DRY_RUN = env_bool("DRY_RUN", False)
+ALLOW_LIVE_TRADING = env_bool("ALLOW_LIVE_TRADING", True)
 MAGIC = env_int("MAGIC", 990011)
 STATE_VERSION = 2
 POLL_SECONDS = env_float("POLL_SECONDS", 15)
